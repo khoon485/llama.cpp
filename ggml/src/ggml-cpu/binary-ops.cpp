@@ -56,6 +56,10 @@ static void apply_binary_op(const ggml_compute_params * params, ggml_tensor * ds
     GGML_TENSOR_BINARY_OP_LOCALS
 
     GGML_ASSERT( nb0 == sizeof(dst_t));
+    if (nb00 != sizeof(src0_t)) {
+        fprintf(stderr, "BINARY OP ERROR: dst='%s' src0='%s' src1='%s' nb00=%zu expected=%zu\n",
+                dst->name, src0->name, src1->name, nb00, sizeof(src0_t));
+    }
     GGML_ASSERT(nb00 == sizeof(src0_t));
 
     const auto [ir0, ir1] = get_thread_range(params, src0);
