@@ -495,7 +495,9 @@ extern "C" {
 
         GGML_OP_MUL_MAT,
         GGML_OP_MUL_MAT_ID,
+        GGML_OP_MUL_MAT_ID_BACK,
         GGML_OP_OUT_PROD,
+        GGML_OP_OUT_PROD_ID,
 
         GGML_OP_SCALE,
         GGML_OP_SET,
@@ -1412,6 +1414,14 @@ extern "C" {
             struct ggml_tensor  * b,
             struct ggml_tensor  * ids);
 
+    // backward pass for MUL_MAT_ID: computes dX = W^T @ dY for each expert
+    GGML_API struct ggml_tensor * ggml_mul_mat_id_back(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * as,
+            struct ggml_tensor  * b,
+            struct ggml_tensor  * ids,
+            struct ggml_tensor  * grad);
+
     // A: m columns, n rows,
     // B: p columns, n rows,
     // result is m columns, p rows
@@ -1419,6 +1429,18 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
             struct ggml_tensor  * b);
+
+    // out_prod with expert routing (for MoE backward pass)
+    // input: [in_features, n_tokens]
+    // grad:  [out_features, n_tokens]
+    // ids:   [n_tokens] (expert indices, I32)
+    // result: [in_features, out_features, n_expert]
+    GGML_API struct ggml_tensor * ggml_out_prod_id(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * input,
+            struct ggml_tensor  * grad,
+            struct ggml_tensor  * ids,
+            int64_t               n_expert);
 
     //
     // operations on tensors without backpropagation

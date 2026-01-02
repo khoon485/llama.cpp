@@ -2197,6 +2197,29 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
             llama_set_param(reinterpret_cast<struct ggml_tensor **>(&layer)[i], param_filter, param_filter_ud);
         }
     }
+
+    // LoRA 어댑터 텐서도 trainable로 등록
+    // 주의: LoRA 텐서는 F16일 수 있으며, 훈련을 위해 F32로 변환 필요
+    int lora_param_count = 0;
+    for (auto & lora_it : loras) {
+        llama_adapter_lora * adapter = lora_it.first;
+        LLAMA_LOG_INFO("%s: processing LoRA adapter with %zu weights\n", __func__, adapter->ab_map.size());
+        for (auto & ab_it : adapter->ab_map) {
+            llama_adapter_lora_weight & w = ab_it.second;
+            // LoRA 텐서는 param_filter만 확인하고 타입은 무시 (F16/F32 모두 허용)
+            if (w.a && param_filter(w.a, param_filter_ud)) {
+                LLAMA_LOG_INFO("%s: registering LoRA tensor %s (type=%d)\n", __func__, w.a->name, w.a->type);
+                ggml_set_param(w.a);
+                lora_param_count++;
+            }
+            if (w.b && param_filter(w.b, param_filter_ud)) {
+                LLAMA_LOG_INFO("%s: registering LoRA tensor %s (type=%d)\n", __func__, w.b->name, w.b->type);
+                ggml_set_param(w.b);
+                lora_param_count++;
+            }
+        }
+    }
+    LLAMA_LOG_INFO("%s: registered %d LoRA parameters\n", __func__, lora_param_count);
 }
 
 void llama_context::opt_epoch_iter(

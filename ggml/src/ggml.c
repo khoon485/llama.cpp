@@ -972,7 +972,9 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
 
     "MUL_MAT",
     "MUL_MAT_ID",
+    "MUL_MAT_ID_BACK",
     "OUT_PROD",
+    "OUT_PROD_ID",
 
     "SCALE",
     "SET",
@@ -1045,7 +1047,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 95, "GGML_OP_COUNT != 95");
+static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 97");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1081,7 +1083,9 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
 
     "X*Y",
     "X[i]*Y",
+    "X[i]*Y_back",
     "X*Y",
+    "X*Y_id",
 
     "x*v",
     "y-\\>view(x)",
@@ -1154,7 +1158,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 95, "GGML_OP_COUNT != 95");
+static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 97");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3238,6 +3242,29 @@ struct ggml_tensor * ggml_mul_mat_id(
     return result;
 }
 
+// ggml_mul_mat_id_back
+// Backward pass for MUL_MAT_ID: computes dX = W^T @ dY for each expert
+// src[0] = as (weights), src[1] = b (input), src[2] = ids, src[3] = grad (dY)
+struct ggml_tensor * ggml_mul_mat_id_back(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * as,
+        struct ggml_tensor  * b,
+        struct ggml_tensor  * ids,
+        struct ggml_tensor  * grad) {
+    GGML_ASSERT(ids->type == GGML_TYPE_I32);
+
+    // Output shape matches input b shape
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, b->ne);
+
+    result->op     = GGML_OP_MUL_MAT_ID_BACK;
+    result->src[0] = as;    // weights
+    result->src[1] = b;     // original input (for shape info)
+    result->src[2] = ids;   // expert routing
+    result->src[3] = grad;  // upstream gradient (dY)
+
+    return result;
+}
+
 // ggml_out_prod
 
 static inline bool ggml_can_out_prod(const struct ggml_tensor * t0, const struct ggml_tensor * t1) {
@@ -3262,6 +3289,33 @@ struct ggml_tensor * ggml_out_prod(
     result->op     = GGML_OP_OUT_PROD;
     result->src[0] = a;
     result->src[1] = b;
+
+    return result;
+}
+
+// ggml_out_prod_id - per-expert outer product for MoE backward pass
+// input: [in_features, n_tokens]
+// grad:  [out_features, n_tokens]
+// ids:   [n_tokens] (expert indices)
+// result: [in_features, out_features, n_expert]
+struct ggml_tensor * ggml_out_prod_id(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * input,
+        struct ggml_tensor  * grad,
+        struct ggml_tensor  * ids,
+        int64_t               n_expert) {
+    GGML_ASSERT(ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(input->ne[1] == grad->ne[1]); // n_tokens must match
+
+    const int64_t ne[4] = { input->ne[0], grad->ne[0], n_expert, 1 };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    result->op     = GGML_OP_OUT_PROD_ID;
+    result->src[0] = input;
+    result->src[1] = grad;
+    result->src[2] = ids;
+
+    memcpy(result->op_params, &n_expert, sizeof(int64_t));
 
     return result;
 }
@@ -6434,6 +6488,24 @@ static void ggml_compute_backward(
                                 grad)));        // [m,p,qq,rr]
             }
         } break;
+        case GGML_OP_MUL_MAT_ID: {
+            // MoE backward: propagate gradient through expert routing
+            // src0 = as (weights, 3D - one matrix per expert)
+            // src1 = b (input)
+            // src2 = ids (expert indices)
+            if (src1_needs_grads) {
+                // dX = W^T @ dY for each expert, routed by ids
+                struct ggml_tensor * tmp = ggml_mul_mat_id_back(ctx, src0, src1, src2, grad);
+                ggml_add_or_set(ctx, cgraph, isrc1, tmp);
+            }
+            if (src0_needs_grads) {
+                // dW = dY @ X^T for each expert (LoRA weight gradients)
+                const int64_t n_expert = src0->ne[2];
+                struct ggml_tensor * tmp = ggml_out_prod_id(ctx, src1, grad, src2, n_expert);
+                ggml_add_or_set(ctx, cgraph, isrc0, tmp);
+            }
+            // src2 (ids) gradient: not differentiable (discrete indices)
+        } break;
         case GGML_OP_SCALE: {
             if (src0_needs_grads) {
                 float s;
@@ -6867,6 +6939,11 @@ void ggml_build_backward_expand(
         }
 
         // inplace operations are currently not supported
+        if (node->view_src && !(node->op == GGML_OP_CPY || node->op == GGML_OP_VIEW ||
+            node->op == GGML_OP_RESHAPE || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_TRANSPOSE)) {
+            fprintf(stderr, "BACKWARD ERROR: node '%s' op=%d has view_src='%s'\n",
+                    node->name, node->op, node->view_src->name);
+        }
         GGML_ASSERT(!node->view_src || node->op == GGML_OP_CPY || node->op == GGML_OP_VIEW ||
             node->op == GGML_OP_RESHAPE || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_TRANSPOSE);
 

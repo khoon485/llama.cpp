@@ -82,6 +82,38 @@
 
 static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
 
+// MoE backward scatter-add kernel: accumulate gradients from expert to original token positions
+__global__ void scatter_add_f32_kernel(
+    float * __restrict__ dst,
+    const float * __restrict__ src,
+    const int32_t * __restrict__ indices,
+    int64_t K,
+    int64_t n_tokens_expert
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n_tokens_expert * K) return;
+
+    int token_local = idx / K;
+    int k = idx % K;
+    int token_global = indices[token_local];
+
+    atomicAdd(&dst[token_global * K + k], src[token_local * K + k]);
+}
+
+static void scatter_add_f32_cuda(
+    float * dst,
+    const float * src,
+    const int32_t * indices,
+    int64_t K,
+    int64_t n_tokens_expert,
+    cudaStream_t stream
+) {
+    const int64_t total = n_tokens_expert * K;
+    const int block_size = 256;
+    const int grid_size = (total + block_size - 1) / block_size;
+    scatter_add_f32_kernel<<<grid_size, block_size, 0, stream>>>(dst, src, indices, K, n_tokens_expert);
+}
+
 [[noreturn]]
 void ggml_cuda_error(const char * stmt, const char * func, const char * file, int line, const char * msg) {
     int id = -1; // in case cudaGetDevice fails
@@ -2412,6 +2444,220 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         nb1, nb2, nb3, stream);
 }
 
+// MoE backward pass: dX = W^T @ dY for each expert, routed by IDs
+static void ggml_cuda_mul_mat_id_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * as   = dst->src[0];  // expert weights [K, N, n_expert]
+    // dst->src[1] is original input (for shape info), not used directly
+    const ggml_tensor * ids  = dst->src[2];  // expert routing [n_expert_used, n_tokens]
+    const ggml_tensor * grad = dst->src[3];  // upstream gradient dY [N, n_tokens]
+
+    GGML_ASSERT(grad->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type  == GGML_TYPE_F32);
+
+    cudaStream_t stream = ctx.stream();
+
+    const int64_t n_expert      = as->ne[2];
+    const int64_t n_tokens      = ids->ne[1];
+    const int64_t n_expert_used = ids->ne[0];
+    const int64_t K = as->ne[0];  // input dimension (dst dimension)
+    const int64_t N = as->ne[1];  // output dimension (grad dimension)
+
+    // Zero initialize output (dX will accumulate from multiple experts)
+    CUDA_CHECK(cudaMemsetAsync(dst->data, 0, ggml_nbytes(dst), stream));
+
+    // Copy IDs to host for routing
+    std::vector<int32_t> ids_host(n_tokens * n_expert_used);
+    CUDA_CHECK(cudaMemcpyAsync(ids_host.data(), ids->data, ggml_nbytes(ids), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    // For each expert, compute backward pass
+    for (int64_t expert_id = 0; expert_id < n_expert; ++expert_id) {
+        // Find which tokens use this expert
+        std::vector<int64_t> token_indices;
+        for (int64_t t = 0; t < n_tokens; ++t) {
+            for (int64_t e = 0; e < n_expert_used; ++e) {
+                if (ids_host[t * n_expert_used + e] == expert_id) {
+                    token_indices.push_back(t);
+                    break;
+                }
+            }
+        }
+
+        if (token_indices.empty()) {
+            continue;
+        }
+
+        const int64_t n_tokens_expert = token_indices.size();
+
+        // Allocate temporary buffers
+        ggml_cuda_pool_alloc<float> grad_gathered(ctx.pool(), n_tokens_expert * N);
+        ggml_cuda_pool_alloc<float> dx_expert(ctx.pool(), n_tokens_expert * K);
+        ggml_cuda_pool_alloc<int32_t> indices_dev(ctx.pool(), n_tokens_expert);
+
+        // Copy indices to device
+        std::vector<int32_t> indices_host(n_tokens_expert);
+        for (size_t i = 0; i < token_indices.size(); ++i) {
+            indices_host[i] = token_indices[i];
+        }
+        CUDA_CHECK(cudaMemcpyAsync(indices_dev.ptr, indices_host.data(), n_tokens_expert * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+
+        // Gather grad rows for this expert's tokens
+        get_rows_cuda(grad->data, grad->type, indices_dev.ptr, grad_gathered.ptr, GGML_TYPE_F32,
+            N, N * sizeof(float), n_tokens * N * sizeof(float), n_tokens * N * sizeof(float),
+            n_tokens_expert, 1, 1, sizeof(int32_t), n_tokens_expert * sizeof(int32_t), n_tokens_expert * sizeof(int32_t),
+            N * sizeof(float), n_tokens_expert * N * sizeof(float), n_tokens_expert * N * sizeof(float), stream);
+
+        // Create tensor slices for matmul: dX = W^T @ dY
+        ggml_tensor W_T_slice;
+        memset(&W_T_slice, 0, sizeof(W_T_slice));
+        W_T_slice.buffer = as->buffer;
+        W_T_slice.type   = as->type;
+        W_T_slice.ne[0]  = N;
+        W_T_slice.ne[1]  = K;
+        W_T_slice.ne[2]  = 1;
+        W_T_slice.ne[3]  = 1;
+        size_t ts = ggml_type_size(as->type);
+        W_T_slice.nb[0]  = K * ts;
+        W_T_slice.nb[1]  = ts;
+        W_T_slice.nb[2]  = K * N * ts;
+        W_T_slice.nb[3]  = W_T_slice.nb[2];
+        W_T_slice.data   = (char *)as->data + expert_id * as->nb[2];
+
+        ggml_tensor grad_slice;
+        memset(&grad_slice, 0, sizeof(grad_slice));
+        grad_slice.buffer = grad->buffer;
+        grad_slice.type   = GGML_TYPE_F32;
+        grad_slice.ne[0]  = N;
+        grad_slice.ne[1]  = n_tokens_expert;
+        grad_slice.ne[2]  = 1;
+        grad_slice.ne[3]  = 1;
+        grad_slice.nb[0]  = sizeof(float);
+        grad_slice.nb[1]  = N * sizeof(float);
+        grad_slice.nb[2]  = grad_slice.ne[1] * grad_slice.nb[1];
+        grad_slice.nb[3]  = grad_slice.ne[2] * grad_slice.nb[2];
+        grad_slice.data   = grad_gathered.ptr;
+
+        ggml_tensor dx_slice;
+        memset(&dx_slice, 0, sizeof(dx_slice));
+        dx_slice.buffer = dst->buffer;
+        dx_slice.type   = GGML_TYPE_F32;
+        dx_slice.ne[0]  = K;
+        dx_slice.ne[1]  = n_tokens_expert;
+        dx_slice.ne[2]  = 1;
+        dx_slice.ne[3]  = 1;
+        dx_slice.nb[0]  = sizeof(float);
+        dx_slice.nb[1]  = K * sizeof(float);
+        dx_slice.nb[2]  = dx_slice.ne[1] * dx_slice.nb[1];
+        dx_slice.nb[3]  = dx_slice.ne[2] * dx_slice.nb[2];
+        dx_slice.data   = dx_expert.ptr;
+
+        // Compute W^T @ grad = dX for this expert
+        ggml_cuda_mul_mat(ctx, &W_T_slice, &grad_slice, &dx_slice);
+        CUDA_CHECK(cudaGetLastError());
+
+        // Scatter results back to dst at original token positions
+        scatter_add_f32_cuda((float *)dst->data, dx_expert.ptr, indices_dev.ptr, K, n_tokens_expert, stream);
+    }
+
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+}
+
+// MoE backward pass for weights: dW = dY @ X^T for each expert
+static void ggml_cuda_out_prod_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * input = dst->src[0];  // input [in_features, n_tokens]
+    const ggml_tensor * grad  = dst->src[1];  // grad [out_features, n_tokens]
+    const ggml_tensor * ids   = dst->src[2];  // expert indices [n_expert_used, n_tokens]
+
+    GGML_ASSERT(input->type == GGML_TYPE_F32);
+    GGML_ASSERT(grad->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(ids->type == GGML_TYPE_I32);
+
+    cudaStream_t stream = ctx.stream();
+    cublasHandle_t handle = ctx.cublas_handle();
+
+    int64_t n_expert;
+    memcpy(&n_expert, dst->op_params, sizeof(int64_t));
+
+    const int64_t in_features   = input->ne[0];
+    const int64_t out_features  = grad->ne[0];
+    const int64_t n_tokens      = input->ne[1];
+    const int64_t n_expert_used = ids->ne[0];
+
+    // Zero initialize output
+    CUDA_CHECK(cudaMemsetAsync(dst->data, 0, ggml_nbytes(dst), stream));
+
+    // Copy IDs to host for routing
+    std::vector<int32_t> ids_host(n_tokens * n_expert_used);
+    CUDA_CHECK(cudaMemcpyAsync(ids_host.data(), ids->data, ggml_nbytes(ids), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    CUBLAS_CHECK(cublasSetStream(handle, stream));
+
+    const float alpha = 1.0f;
+    const float beta  = 1.0f;  // accumulate
+
+    // For each expert, compute dW = dY @ X^T
+    for (int64_t expert_id = 0; expert_id < n_expert; ++expert_id) {
+        // Find which tokens use this expert
+        std::vector<int64_t> token_indices;
+        for (int64_t t = 0; t < n_tokens; ++t) {
+            for (int64_t e = 0; e < n_expert_used; ++e) {
+                if (ids_host[t * n_expert_used + e] == expert_id) {
+                    token_indices.push_back(t);
+                    break;
+                }
+            }
+        }
+
+        if (token_indices.empty()) {
+            continue;
+        }
+
+        const int64_t n_tokens_expert = token_indices.size();
+
+        // Allocate temporary buffers for gathered data
+        ggml_cuda_pool_alloc<float> input_gathered(ctx.pool(), n_tokens_expert * in_features);
+        ggml_cuda_pool_alloc<float> grad_gathered(ctx.pool(), n_tokens_expert * out_features);
+        ggml_cuda_pool_alloc<int32_t> indices_dev(ctx.pool(), n_tokens_expert);
+
+        // Copy indices to device
+        std::vector<int32_t> indices_host(n_tokens_expert);
+        for (size_t i = 0; i < token_indices.size(); ++i) {
+            indices_host[i] = token_indices[i];
+        }
+        CUDA_CHECK(cudaMemcpyAsync(indices_dev.ptr, indices_host.data(), n_tokens_expert * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+
+        // Gather input rows for this expert's tokens
+        get_rows_cuda(input->data, input->type, indices_dev.ptr, input_gathered.ptr, GGML_TYPE_F32,
+            in_features, in_features * sizeof(float), n_tokens * in_features * sizeof(float), n_tokens * in_features * sizeof(float),
+            n_tokens_expert, 1, 1, sizeof(int32_t), n_tokens_expert * sizeof(int32_t), n_tokens_expert * sizeof(int32_t),
+            in_features * sizeof(float), n_tokens_expert * in_features * sizeof(float), n_tokens_expert * in_features * sizeof(float), stream);
+
+        // Gather grad rows for this expert's tokens
+        get_rows_cuda(grad->data, grad->type, indices_dev.ptr, grad_gathered.ptr, GGML_TYPE_F32,
+            out_features, out_features * sizeof(float), n_tokens * out_features * sizeof(float), n_tokens * out_features * sizeof(float),
+            n_tokens_expert, 1, 1, sizeof(int32_t), n_tokens_expert * sizeof(int32_t), n_tokens_expert * sizeof(int32_t),
+            out_features * sizeof(float), n_tokens_expert * out_features * sizeof(float), n_tokens_expert * out_features * sizeof(float), stream);
+
+        // Compute dW[expert] = X^T @ dY = sum over tokens of (x @ dy^T)
+        // Using cuBLAS SGEMM: C = alpha * A * B + beta * C
+        // dW[in_features, out_features] = X^T[in_features, n_tokens] @ dY[n_tokens, out_features]
+        // In column-major: dW = X_gathered^T @ grad_gathered
+        float * dW_expert = (float *)dst->data + expert_id * in_features * out_features;
+
+        CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_T,
+            in_features, out_features, n_tokens_expert,
+            &alpha,
+            input_gathered.ptr, in_features,
+            grad_gathered.ptr, out_features,
+            &beta,
+            dW_expert, in_features));
+    }
+
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+}
+
 static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
     // why is this here instead of mul_mat?
     if (dst->src[0] != nullptr && ggml_backend_buft_is_cuda_split(dst->src[0]->buffer->buft)) {
@@ -2612,8 +2858,14 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_MUL_MAT_ID:
             ggml_cuda_mul_mat_id(ctx, dst);
             break;
+        case GGML_OP_MUL_MAT_ID_BACK:
+            ggml_cuda_mul_mat_id_back(ctx, dst);
+            break;
         case GGML_OP_OUT_PROD:
             ggml_cuda_out_prod(ctx, dst);
+            break;
+        case GGML_OP_OUT_PROD_ID:
+            ggml_cuda_out_prod_id(ctx, dst);
             break;
         case GGML_OP_SCALE:
             ggml_cuda_op_scale(ctx, dst);
@@ -4412,6 +4664,12 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 }
             } break;
         case GGML_OP_OUT_PROD:
+            return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32;
+        case GGML_OP_MUL_MAT_ID_BACK:
+            // backward pass for MoE, supports F32 only
+            return op->type == GGML_TYPE_F32 && op->src[3]->type == GGML_TYPE_F32;
+        case GGML_OP_OUT_PROD_ID:
+            // weight gradient for MoE, supports F32 only
             return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32;
         case GGML_OP_GET_ROWS:
             {
