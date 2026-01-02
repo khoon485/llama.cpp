@@ -5,7 +5,15 @@ target_link_libraries(${TARGET} PRIVATE common llama ${CMAKE_THREAD_LIBS_INIT})
 target_compile_features(${TARGET} PRIVATE cxx_std_11)
 
 set(TARGET llama-finetune-lora)
-add_executable(${TARGET} finetune-lora.cpp)
+add_executable(${TARGET}
+    finetune-lora.cpp
+    optimizer.cpp
+    lora_utils.cpp
+    moe_utils.cpp
+    moe_graph.cpp
+    bridge.cpp
+    moe_trainer.cpp
+)
 install(TARGETS ${TARGET} RUNTIME)
 target_link_libraries(${TARGET} PRIVATE common llama ${CMAKE_THREAD_LIBS_INIT})
 target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR}/src)
