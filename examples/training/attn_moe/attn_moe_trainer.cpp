@@ -152,13 +152,6 @@ bool run_attn_moe_training(
         struct ggml_tensor * task_loss = ggml_scale(ctx, ggml_sum(ctx, alignment), -1.0f / (float)(n_embd * n_tokens));
         struct ggml_tensor * rsl_loss = build_rsl_loss(ctx, router_probs, config.rsl_alpha, config.rsl_lambda);
 
-        fprintf(stderr, "[LOSS] task_loss shape: [%lld, %lld, %lld, %lld]\n",
-                (long long)task_loss->ne[0], (long long)task_loss->ne[1],
-                (long long)task_loss->ne[2], (long long)task_loss->ne[3]);
-        fprintf(stderr, "[LOSS] rsl_loss shape: [%lld, %lld, %lld, %lld]\n",
-                (long long)rsl_loss->ne[0], (long long)rsl_loss->ne[1],
-                (long long)rsl_loss->ne[2], (long long)rsl_loss->ne[3]);
-
         struct ggml_tensor * loss = ggml_add(ctx, task_loss, rsl_loss);
         ggml_set_name(loss, "total_loss");
         ggml_set_output(loss);
@@ -204,7 +197,9 @@ bool run_attn_moe_training(
 
         // Backend
         ggml_backend_t backend = ggml_backend_cuda_init(0);
-        if (!backend) backend = ggml_backend_cpu_init();
+        if (!backend) {
+            backend = ggml_backend_cpu_init();
+        }
         if (!backend) { ggml_free(ctx); continue; }
 
         ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);

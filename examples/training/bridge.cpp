@@ -1,6 +1,10 @@
-// bridge.cpp - Hidden States 캡처 및 CE Gradient 계산 구현
-// Fail-Fast 원칙: 데이터 없으면 바로 터지고, 원인을 명확히 알려줌
+// bridge.cpp - Hidden states capture and CE gradient computation
+// Fail-Fast: exit immediately on missing data with clear diagnostics
 #include "bridge.h"
+
+#include "ggml.h"
+#include "ggml-backend.h"
+#include "ggml-cuda.h"
 
 #include <cstring>
 #include <cmath>
@@ -8,7 +12,7 @@
 #include <cstdlib>
 
 // ============================================================================
-// 캡처 데이터 검증 (Fail-Fast)
+// Capture data validation (Fail-Fast)
 // ============================================================================
 
 static bool g_first_verify = true;
@@ -24,7 +28,7 @@ void verify_hidden_states_or_exit(const all_layer_hidden_states & states) {
         }
     }
 
-    // 모든 레이어 캡처 성공
+    // all layers captured successfully
     if (missing_input == 0) {
         if (g_first_verify) {
             LOG_INF("Hidden states: %d layers captured (n_embd=%d, n_tokens=%d)\n",
@@ -34,7 +38,7 @@ void verify_hidden_states_or_exit(const all_layer_hidden_states & states) {
         return;
     }
 
-    // 실패 시 상세 진단
+    // detailed diagnostics on failure
     LOG_ERR("\n");
     LOG_ERR("╔══════════════════════════════════════════════════════════════╗\n");
     LOG_ERR("║  [FATAL] Hidden states capture FAILED                        ║\n");
@@ -57,7 +61,7 @@ void verify_hidden_states_or_exit(const all_layer_hidden_states & states) {
     LOG_ERR("\n");
 
     if (missing_input == states.n_layers) {
-        // 전체 실패 - cb_eval 자체가 호출 안 됨
+        // total failure - cb_eval not being called at all
         LOG_ERR("[1] cb_eval callback is NOT being called at all.\n");
         LOG_ERR("    Possible causes:\n");
         LOG_ERR("      - params.cb_eval was not set before llama_decode()\n");
@@ -71,7 +75,7 @@ void verify_hidden_states_or_exit(const all_layer_hidden_states & states) {
         LOG_ERR("    Check your model's tensor names with:\n");
         LOG_ERR("      llama-cli --model <model> --verbose 2>&1 | grep ffn\n");
     } else {
-        // 부분 실패 - 일부 레이어만 캡처됨
+        // partial failure - only some layers captured
         LOG_ERR("[1] Partial capture: %d/%d layers succeeded.\n",
                 states.n_layers - missing_input, states.n_layers);
         LOG_ERR("    This suggests tensor naming inconsistency in the model.\n");
@@ -91,7 +95,7 @@ void verify_hidden_states_or_exit(const all_layer_hidden_states & states) {
 }
 
 // ============================================================================
-// cb_eval 콜백 함수
+// cb_eval callback function
 // ============================================================================
 
 bool hidden_states_eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
@@ -111,7 +115,7 @@ bool hidden_states_eval_callback(struct ggml_tensor * t, bool ask, void * user_d
     bool is_input = false;
     bool is_output = false;
 
-    // MoE 입력 패턴
+    // MoE input patterns
     if (strncmp(name, "ffn_norm-", 9) == 0) {
         layer_idx = atoi(name + 9);
         is_input = true;
@@ -119,7 +123,7 @@ bool hidden_states_eval_callback(struct ggml_tensor * t, bool ask, void * user_d
         layer_idx = atoi(name + 15);
         is_input = true;
     }
-    // MoE 출력 패턴 - 순수 MoE 출력만!
+    // MoE output patterns
     else if (strncmp(name, "ffn_moe_out-", 12) == 0) {
         layer_idx = atoi(name + 12);
         is_output = true;
@@ -155,7 +159,7 @@ bool hidden_states_eval_callback(struct ggml_tensor * t, bool ask, void * user_d
 }
 
 // ============================================================================
-// CE Gradient 계산
+// CE Gradient 계산 (GPU accelerated)
 // ============================================================================
 
 bool compute_ce_gradient_through_lm_head(
@@ -170,7 +174,86 @@ bool compute_ce_gradient_through_lm_head(
     out_grad_hidden.resize(n_embd * n_tokens);
     std::fill(out_grad_hidden.begin(), out_grad_hidden.end(), 0.0f);
 
-    // lm_head weights 가져오기 (F32로 변환)
+    // Step 1: Compute grad_logits on CPU (softmax + CE gradient) - this is fast
+    std::vector<float> grad_logits_all(n_vocab * n_tokens);
+    for (int t = 0; t < n_tokens; t++) {
+        const float * logits_t = &logits[t * n_vocab];
+        llama_token target = target_tokens[t];
+
+        // softmax
+        float max_logit = -INFINITY;
+        for (int v = 0; v < n_vocab; v++) {
+            if (logits_t[v] > max_logit) max_logit = logits_t[v];
+        }
+        float sum_exp = 0.0f;
+        for (int v = 0; v < n_vocab; v++) {
+            float p = expf(logits_t[v] - max_logit);
+            grad_logits_all[t * n_vocab + v] = p;
+            sum_exp += p;
+        }
+        for (int v = 0; v < n_vocab; v++) {
+            grad_logits_all[t * n_vocab + v] /= sum_exp;
+        }
+        // CE gradient: probs - one_hot(target)
+        if (target >= 0 && target < n_vocab) {
+            grad_logits_all[t * n_vocab + target] -= 1.0f;
+        }
+    }
+
+    // Step 2: Matrix multiply on GPU: grad_hidden = lm_head^T @ grad_logits
+    // lm_head shape: [n_vocab, n_embd] or [n_embd, n_vocab]
+    // grad_logits: [n_vocab, n_tokens]
+    // grad_hidden: [n_embd, n_tokens]
+
+    size_t ctx_size = 256 * 1024 * 1024;  // 256MB
+    struct ggml_init_params params = { ctx_size, nullptr, true };
+    struct ggml_context * ctx = ggml_init(params);
+    if (!ctx) {
+        LOG_ERR("compute_ce_gradient: failed to init ggml context\n");
+        return false;
+    }
+
+    // Create tensors
+    struct ggml_tensor * t_grad_logits = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_vocab, n_tokens);
+    struct ggml_tensor * t_lm_head = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_vocab, n_embd);
+    ggml_set_name(t_grad_logits, "grad_logits");
+    ggml_set_name(t_lm_head, "lm_head_f32");
+    ggml_set_input(t_grad_logits);
+    ggml_set_input(t_lm_head);
+
+    // grad_hidden = lm_head^T @ grad_logits = [n_embd, n_vocab] @ [n_vocab, n_tokens] = [n_embd, n_tokens]
+    // In ggml: mul_mat(A, B) computes A^T @ B, so we need mul_mat(lm_head, grad_logits)
+    struct ggml_tensor * t_grad_hidden = ggml_mul_mat(ctx, t_lm_head, t_grad_logits);
+    ggml_set_name(t_grad_hidden, "grad_hidden");
+    ggml_set_output(t_grad_hidden);
+
+    // Build graph
+    struct ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, t_grad_hidden);
+
+    // Backend - prefer CUDA
+    ggml_backend_t backend = ggml_backend_cuda_init(0);
+    if (!backend) {
+        backend = ggml_backend_cpu_init();
+    }
+    if (!backend) {
+        LOG_ERR("compute_ce_gradient: failed to init backend\n");
+        ggml_free(ctx);
+        return false;
+    }
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    if (!buf) {
+        LOG_ERR("compute_ce_gradient: failed to alloc buffer\n");
+        ggml_backend_free(backend);
+        ggml_free(ctx);
+        return false;
+    }
+
+    // Load grad_logits data
+    ggml_backend_tensor_set(t_grad_logits, grad_logits_all.data(), 0, n_vocab * n_tokens * sizeof(float));
+
+    // Load lm_head data (need to dequantize if necessary)
     std::vector<float> lm_head_f32;
     size_t lm_head_elements = ggml_nelements(lm_head);
     lm_head_f32.resize(lm_head_elements);
@@ -184,11 +267,13 @@ bool compute_ce_gradient_through_lm_head(
             lm_head_f32[i] = ggml_fp16_to_fp32(f16_buf[i]);
         }
     } else {
-        // Quantized - dequantize
+        // Quantized - dequantize row by row
         const struct ggml_type_traits * traits = ggml_get_type_traits(lm_head->type);
         if (!traits->to_float) {
-            LOG_ERR("compute_ce_gradient: cannot dequantize lm_head type %s\n",
-                    ggml_type_name(lm_head->type));
+            LOG_ERR("compute_ce_gradient: cannot dequantize lm_head type %s\n", ggml_type_name(lm_head->type));
+            ggml_backend_buffer_free(buf);
+            ggml_backend_free(backend);
+            ggml_free(ctx);
             return false;
         }
         int64_t blck_size = ggml_blck_size(lm_head->type);
@@ -204,68 +289,38 @@ bool compute_ce_gradient_through_lm_head(
         }
     }
 
-    // lm_head shape 확인
+    // lm_head may be transposed, need to check and adjust
     bool transposed = (lm_head->ne[0] == n_vocab);
-    (void)transposed;  // used below
-
-    // 각 토큰에 대해 CE gradient 계산 후 역전파
-    for (int t = 0; t < n_tokens; t++) {
-        const float * logits_t = &logits[t * n_vocab];
-        llama_token target = target_tokens[t];
-
-        // softmax 계산
-        float max_logit = -INFINITY;
-        for (int v = 0; v < n_vocab; v++) {
-            if (logits_t[v] > max_logit) max_logit = logits_t[v];
-        }
-        std::vector<float> probs(n_vocab);
-        float sum_exp = 0.0f;
-        for (int v = 0; v < n_vocab; v++) {
-            probs[v] = expf(logits_t[v] - max_logit);
-            sum_exp += probs[v];
-        }
-        for (int v = 0; v < n_vocab; v++) {
-            probs[v] /= sum_exp;
-        }
-
-        // dL/d_logits = probs - one_hot(target)
-        std::vector<float> grad_logits(n_vocab);
-        for (int v = 0; v < n_vocab; v++) {
-            grad_logits[v] = probs[v];
-        }
-        if (target >= 0 && target < n_vocab) {
-            grad_logits[target] -= 1.0f;
-        }
-
-        // 역전파: dL/d_hidden = lm_head^T @ dL/d_logits
-        float * grad_hidden_t = &out_grad_hidden[t * n_embd];
-
-        if (transposed) {
-            // lm_head: [n_vocab, n_embd]
-            for (int e = 0; e < n_embd; e++) {
-                float sum = 0.0f;
-                for (int v = 0; v < n_vocab; v++) {
-                    sum += lm_head_f32[v * n_embd + e] * grad_logits[v];
-                }
-                grad_hidden_t[e] = sum;
-            }
-        } else {
-            // lm_head: [n_embd, n_vocab]
-            for (int e = 0; e < n_embd; e++) {
-                float sum = 0.0f;
-                for (int v = 0; v < n_vocab; v++) {
-                    sum += lm_head_f32[e * n_vocab + v] * grad_logits[v];
-                }
-                grad_hidden_t[e] = sum;
+    if (transposed) {
+        // lm_head is [n_vocab, n_embd], already correct shape
+        ggml_backend_tensor_set(t_lm_head, lm_head_f32.data(), 0, n_vocab * n_embd * sizeof(float));
+    } else {
+        // lm_head is [n_embd, n_vocab], need to transpose
+        std::vector<float> lm_head_t(n_vocab * n_embd);
+        for (int e = 0; e < n_embd; e++) {
+            for (int v = 0; v < n_vocab; v++) {
+                lm_head_t[v * n_embd + e] = lm_head_f32[e * n_vocab + v];
             }
         }
+        ggml_backend_tensor_set(t_lm_head, lm_head_t.data(), 0, n_vocab * n_embd * sizeof(float));
     }
+
+    // Compute
+    ggml_backend_graph_compute(backend, gf);
+
+    // Read result
+    ggml_backend_tensor_get(t_grad_hidden, out_grad_hidden.data(), 0, n_embd * n_tokens * sizeof(float));
+
+    // Cleanup
+    ggml_backend_buffer_free(buf);
+    ggml_backend_free(backend);
+    ggml_free(ctx);
 
     return true;
 }
 
 // ============================================================================
-// Loss 계산
+// Loss computation
 // ============================================================================
 
 float compute_loss(
@@ -331,7 +386,7 @@ float compute_loss(
 }
 
 // ============================================================================
-// High-level 함수들
+// High-level functions
 // ============================================================================
 
 #include "common.h"
@@ -344,9 +399,9 @@ void bridge_run_capture_phase(
         all_layer_hidden_states & out_states,
         int n_layers) {
 
-    (void)lora;  // LoRA 켠 상태로 캡처
+    (void)lora;  // capture with LoRA enabled
 
-    // 상태 초기화
+    // initialize state
     out_states.n_layers = n_layers;
     out_states.layer_input.resize(n_layers);
     out_states.layer_output.resize(n_layers);
@@ -358,10 +413,10 @@ void bridge_run_capture_phase(
     out_states.n_tokens = 0;
     out_states.capture_enabled = true;
 
-    // KV cache 클리어
+    // clear KV cache
     llama_memory_clear(llama_get_memory(ctx), true);
 
-    // 배치 구성
+    // build batch
     int n_tokens = (int)input_tokens.size();
     llama_batch batch = llama_batch_init(n_tokens, 0, 1);
     for (int i = 0; i < n_tokens; i++) {
@@ -373,7 +428,7 @@ void bridge_run_capture_phase(
         batch.n_tokens++;
     }
 
-    // Forward 실행 (LoRA 포함)
+    // forward pass (with LoRA)
     if (llama_decode(ctx, batch) != 0) {
         LOG_ERR("[FATAL] llama_decode failed during capture phase\n");
         llama_batch_free(batch);
@@ -383,7 +438,7 @@ void bridge_run_capture_phase(
 
     out_states.capture_enabled = false;
 
-    // 검증 (실패시 exit)
+    // verify (exit on failure)
     verify_hidden_states_or_exit(out_states);
 }
 
@@ -395,7 +450,7 @@ void bridge_compute_initial_ce_gradient(
         int n_tokens,
         std::vector<float> & out_layer_grad) {
 
-    // lm_head 찾기
+    // find lm_head
     struct ggml_tensor * lm_head = find_lm_head(model);
     if (!lm_head) {
         LOG_ERR("[FATAL] Failed to find lm_head tensor\n");
@@ -403,7 +458,7 @@ void bridge_compute_initial_ce_gradient(
         exit(1);
     }
 
-    // Forward 실행해서 logits 얻기
+    // forward pass to get logits
     llama_memory_clear(llama_get_memory(ctx), true);
     llama_batch batch = llama_batch_init(n_tokens, 0, 1);
     for (int i = 0; i < n_tokens; i++) {
@@ -421,7 +476,7 @@ void bridge_compute_initial_ce_gradient(
     }
     llama_batch_free(batch);
 
-    // Logits 복사
+    // copy logits
     const llama_vocab * vocab = llama_model_get_vocab(model);
     int n_vocab = llama_vocab_n_tokens(vocab);
     int n_embd = llama_model_n_embd(model);
@@ -434,7 +489,7 @@ void bridge_compute_initial_ce_gradient(
         }
     }
 
-    // CE gradient 계산
+    // compute CE gradient
     if (!compute_ce_gradient_through_lm_head(lm_head, all_logits.data(), target_tokens,
                                               n_tokens, n_embd, n_vocab, out_layer_grad)) {
         LOG_ERR("[FATAL] Failed to compute CE gradient\n");

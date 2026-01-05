@@ -1,4 +1,4 @@
-// attn_moe_graph.cpp - LoRA-Mixer 스타일 Attention MoE 그래프 빌더 구현
+// attn_moe_graph.cpp - LoRA-Mixer style Attention MoE graph builder
 #include "attn_moe_graph.h"
 
 #include <cstring>
@@ -6,7 +6,7 @@
 #include <random>
 
 // ============================================================================
-// Context 초기화
+// Context initialization
 // ============================================================================
 
 bool attn_moe_init_context(
@@ -28,7 +28,7 @@ bool attn_moe_init_context(
     ctx->backend = backend;
     ctx->training_mode = true;
 
-    // GGML context 생성 (no_alloc 모드)
+    // Create GGML context (no_alloc mode)
     size_t ctx_size = 256 * 1024 * 1024;  // 256 MB
     struct ggml_init_params params = {
         /*.mem_size   =*/ ctx_size,
@@ -41,7 +41,7 @@ bool attn_moe_init_context(
         return false;
     }
 
-    // 레이어별 context 초기화
+    // Initialize per-layer context
     ctx->layers.resize(config->n_layers);
 
     int n_embd = config->n_embd;
@@ -51,8 +51,8 @@ bool attn_moe_init_context(
     int rank = config->rank;
     int n_experts = config->n_experts;
 
-    // Q,K,V,O 출력 차원
-    int q_out = n_head * head_dim;      // n_embd
+    // Q,K,V,O output dimensions
+    int q_out = n_head * head_dim;
     int k_out = n_head_kv * head_dim;   // GQA: n_head_kv < n_head
     int v_out = n_head_kv * head_dim;
     int o_out = n_embd;
@@ -75,7 +75,7 @@ bool attn_moe_init_context(
         snprintf(name_buf, sizeof(name_buf), "l%d_v_lora_a", layer);
         init_expert_weights(&lctx.v, ctx->ctx, n_embd, v_out, rank, n_experts, name_buf);
 
-        // O expert weights (입력은 n_embd, 출력도 n_embd)
+        // O expert weights (input: n_embd, output: n_embd)
         snprintf(name_buf, sizeof(name_buf), "l%d_o_lora_a", layer);
         init_expert_weights(&lctx.o, ctx->ctx, n_embd, o_out, rank, n_experts, name_buf);
 
@@ -102,7 +102,7 @@ void attn_moe_free_context(struct attn_moe_train_context * ctx) {
 }
 
 // ============================================================================
-// Utility: Weight 초기화
+// Utility: Weight initialization
 // ============================================================================
 
 void init_expert_weights(
@@ -118,12 +118,12 @@ void init_expert_weights(
     snprintf(name_a, sizeof(name_a), "%s", name_prefix);
     snprintf(name_b, sizeof(name_b), "%s_b", name_prefix);
 
-    // LoRA A: [in_dim, rank, n_experts] - 입력 projection
+    // LoRA A: [in_dim, rank, n_experts] - input projection
     weights->lora_a = ggml_new_tensor_3d(ggml_ctx, GGML_TYPE_F32, in_dim, rank, n_experts);
     ggml_set_name(weights->lora_a, name_a);
     ggml_set_param(weights->lora_a);
 
-    // LoRA B: [rank, out_dim, n_experts] - 출력 projection
+    // LoRA B: [rank, out_dim, n_experts] - output projection
     weights->lora_b = ggml_new_tensor_3d(ggml_ctx, GGML_TYPE_F32, rank, out_dim, n_experts);
     ggml_set_name(weights->lora_b, name_b);
     ggml_set_param(weights->lora_b);
@@ -170,7 +170,7 @@ void create_gradient_tensors(
 }
 
 // ============================================================================
-// Soft Routing: 모든 expert weighted sum
+// Soft Routing: weighted sum of all experts
 // ============================================================================
 
 struct ggml_tensor * build_moe_soft_routing(
@@ -184,15 +184,14 @@ struct ggml_tensor * build_moe_soft_routing(
     int in_dim = inp->ne[0];
     int n_tokens = inp->ne[1];
     int n_experts = lora_a->ne[2];
-    int rank = lora_a->ne[1];
     int out_dim = lora_b->ne[1];
 
-    // inp를 3D로 확장: [in_dim, n_tokens, 1] -> [in_dim, n_tokens, n_experts]
+    // expand inp to 3D: [in_dim, n_tokens, 1] -> [in_dim, n_tokens, n_experts]
     struct ggml_tensor * inp_3d = ggml_cont(ggml_ctx, ggml_reshape_3d(ggml_ctx, inp, in_dim, n_tokens, 1));
     struct ggml_tensor * inp_batch = ggml_cont(ggml_ctx, ggml_repeat_4d(ggml_ctx, inp_3d, in_dim, n_tokens, n_experts, 1));
     ggml_set_name(inp_batch, "inp_batch");
 
-    // Expert별 LoRA 적용
+    // apply LoRA per expert
     // A @ inp: [rank, n_tokens, n_experts]
     struct ggml_tensor * tmp = ggml_mul_mat(ggml_ctx, lora_a, inp_batch);
     ggml_set_name(tmp, "lora_a_out");
@@ -203,7 +202,7 @@ struct ggml_tensor * build_moe_soft_routing(
     lora_out = ggml_cont(ggml_ctx, ggml_permute(ggml_ctx, lora_out, 0, 2, 1, 3));
     ggml_set_name(lora_out, "lora_b_out");
 
-    // Router probs로 가중치 적용
+    // apply router probs as weights
     // router_probs: [n_experts, n_tokens] -> [1, n_experts, n_tokens]
     struct ggml_tensor * probs_3d = ggml_cont(ggml_ctx, ggml_reshape_3d(ggml_ctx, router_probs, 1, n_experts, n_tokens));
 
@@ -213,13 +212,13 @@ struct ggml_tensor * build_moe_soft_routing(
     struct ggml_tensor * gated = ggml_mul(ggml_ctx, lora_out, probs_3d);
     ggml_set_name(gated, "gated");
 
-    // Expert 차원 합산: [out_dim, n_experts, n_tokens] -> [out_dim, n_tokens]
+    // sum over expert dimension: [out_dim, n_experts, n_tokens] -> [out_dim, n_tokens]
     struct ggml_tensor * gated_perm = ggml_permute(ggml_ctx, gated, 1, 0, 2, 3);  // [n_experts, out_dim, n_tokens]
     struct ggml_tensor * summed = ggml_sum_rows(ggml_ctx, ggml_cont(ggml_ctx, gated_perm));  // [1, out_dim, n_tokens]
     struct ggml_tensor * result = ggml_reshape_2d(ggml_ctx, summed, out_dim, n_tokens);
     ggml_set_name(result, "moe_sum");
 
-    // Scale 적용
+    // apply scale
     result = ggml_scale(ggml_ctx, result, scale);
     ggml_set_name(result, "moe_scaled");
 
@@ -239,74 +238,30 @@ struct ggml_tensor * build_rsl_loss(
     int n_experts = router_probs->ne[0];
     int n_tokens = router_probs->ne[1];
 
-    // RSL Loss (Route-Specialization Balance) from LoRA-Mixer paper
-
-    fprintf(stderr, "[RSL] router_probs: [%lld, %lld, %lld, %lld]\n",
-            (long long)router_probs->ne[0], (long long)router_probs->ne[1],
-            (long long)router_probs->ne[2], (long long)router_probs->ne[3]);
-
-    // Term 1: Load Balance Loss
+    // Term 1: Load Balance Loss = n_experts * sum(p^2) / n_tokens
     struct ggml_tensor * probs_sq = ggml_sqr(ggml_ctx, router_probs);
-    fprintf(stderr, "[RSL] probs_sq: [%lld, %lld, %lld, %lld]\n",
-            (long long)probs_sq->ne[0], (long long)probs_sq->ne[1],
-            (long long)probs_sq->ne[2], (long long)probs_sq->ne[3]);
-
     struct ggml_tensor * balance_sum = ggml_sum(ggml_ctx, probs_sq);
-    fprintf(stderr, "[RSL] balance_sum: [%lld, %lld, %lld, %lld]\n",
-            (long long)balance_sum->ne[0], (long long)balance_sum->ne[1],
-            (long long)balance_sum->ne[2], (long long)balance_sum->ne[3]);
-
     struct ggml_tensor * balance_loss = ggml_scale(ggml_ctx, balance_sum, (float)n_experts / (float)n_tokens);
-    fprintf(stderr, "[RSL] balance_loss: [%lld, %lld, %lld, %lld]\n",
-            (long long)balance_loss->ne[0], (long long)balance_loss->ne[1],
-            (long long)balance_loss->ne[2], (long long)balance_loss->ne[3]);
     ggml_set_name(balance_loss, "balance_loss");
 
-    // Term 2: Entropy Regularizer
+    // Term 2: Entropy Regularizer = -sum(p * log(p)) / n_tokens
     struct ggml_tensor * log_probs = ggml_log(ggml_ctx, router_probs);
-    fprintf(stderr, "[RSL] log_probs: [%lld, %lld, %lld, %lld]\n",
-            (long long)log_probs->ne[0], (long long)log_probs->ne[1],
-            (long long)log_probs->ne[2], (long long)log_probs->ne[3]);
-
     struct ggml_tensor * p_log_p = ggml_mul(ggml_ctx, router_probs, log_probs);
-    fprintf(stderr, "[RSL] p_log_p: [%lld, %lld, %lld, %lld]\n",
-            (long long)p_log_p->ne[0], (long long)p_log_p->ne[1],
-            (long long)p_log_p->ne[2], (long long)p_log_p->ne[3]);
-
     struct ggml_tensor * neg_entropy_sum = ggml_sum(ggml_ctx, p_log_p);
-    fprintf(stderr, "[RSL] neg_entropy_sum: [%lld, %lld, %lld, %lld]\n",
-            (long long)neg_entropy_sum->ne[0], (long long)neg_entropy_sum->ne[1],
-            (long long)neg_entropy_sum->ne[2], (long long)neg_entropy_sum->ne[3]);
-
     struct ggml_tensor * mean_entropy = ggml_scale(ggml_ctx, neg_entropy_sum, -1.0f / n_tokens);
-    fprintf(stderr, "[RSL] mean_entropy: [%lld, %lld, %lld, %lld]\n",
-            (long long)mean_entropy->ne[0], (long long)mean_entropy->ne[1],
-            (long long)mean_entropy->ne[2], (long long)mean_entropy->ne[3]);
     ggml_set_name(mean_entropy, "mean_entropy");
 
-    // Combined
+    // Combined: RSL = alpha * balance_loss - lambda * mean_entropy
     struct ggml_tensor * scaled_balance = ggml_scale(ggml_ctx, balance_loss, alpha);
-    fprintf(stderr, "[RSL] scaled_balance: [%lld, %lld, %lld, %lld]\n",
-            (long long)scaled_balance->ne[0], (long long)scaled_balance->ne[1],
-            (long long)scaled_balance->ne[2], (long long)scaled_balance->ne[3]);
-
     struct ggml_tensor * scaled_entropy = ggml_scale(ggml_ctx, mean_entropy, -lambda);
-    fprintf(stderr, "[RSL] scaled_entropy: [%lld, %lld, %lld, %lld]\n",
-            (long long)scaled_entropy->ne[0], (long long)scaled_entropy->ne[1],
-            (long long)scaled_entropy->ne[2], (long long)scaled_entropy->ne[3]);
-
     struct ggml_tensor * rsl = ggml_add(ggml_ctx, scaled_balance, scaled_entropy);
-    fprintf(stderr, "[RSL] rsl: [%lld, %lld, %lld, %lld]\n",
-            (long long)rsl->ne[0], (long long)rsl->ne[1],
-            (long long)rsl->ne[2], (long long)rsl->ne[3]);
     ggml_set_name(rsl, "rsl_loss");
 
-    fprintf(stderr, "[RSL] build_rsl_loss done\n");
     return rsl;
 }
 
 // ============================================================================
-// Q projection만 테스트용 forward
+// Q projection forward (for testing)
 // ============================================================================
 
 struct ggml_tensor * build_attn_moe_q_forward(
@@ -335,7 +290,7 @@ struct ggml_tensor * build_attn_moe_q_forward(
 }
 
 // ============================================================================
-// 전체 Q,K,V,O forward
+// Full Q,K,V,O forward
 // ============================================================================
 
 struct ggml_tensor * build_attn_moe_full_forward(
@@ -382,9 +337,9 @@ struct ggml_tensor * build_attn_moe_full_forward(
     struct ggml_tensor * v = ggml_add(ggml_ctx, v_base, v_lora);
     ggml_set_name(v, "v");
 
-    // 간단화: Attention 계산은 생략하고 V를 직접 사용
-    // 실제 구현에서는 Q @ K^T -> softmax -> @ V 계산 필요
-    // 여기서는 LoRA 학습에 집중하므로 attn_out = V 로 근사
+    // simplified: skip attention computation, use V directly
+    // full implementation would compute Q @ K^T -> softmax -> @ V
+    // here we focus on LoRA training, so attn_out = V as approximation
     struct ggml_tensor * attn_out = v;
     ggml_set_name(attn_out, "attn_out");
 
@@ -400,7 +355,7 @@ struct ggml_tensor * build_attn_moe_full_forward(
 }
 
 // ============================================================================
-// 단일 레이어 학습 그래프 빌드
+// Build single layer training graph
 // ============================================================================
 
 bool build_attn_moe_train_graph(
@@ -416,12 +371,12 @@ bool build_attn_moe_train_graph(
     float lora_scale = ctx->lora_alpha / (float)ctx->rank;
 
     // ========================================
-    // 입력 텐서
+    // Input tensors
     // ========================================
     ctx->inp = ggml_new_tensor_2d(ggml_ctx, GGML_TYPE_F32, n_embd, n_tokens);
     ggml_set_name(ctx->inp, "inp");
     ggml_set_input(ctx->inp);
-    ggml_set_param(ctx->inp);  // gradient 계산용
+    ggml_set_param(ctx->inp);  // for gradient computation
 
     // target: CE gradient [n_embd, n_tokens]
     ctx->target = ggml_new_tensor_2d(ggml_ctx, GGML_TYPE_F32, n_embd, n_tokens);
@@ -438,8 +393,7 @@ bool build_attn_moe_train_graph(
     ggml_set_name(layer.router_probs, "router_probs");
 
     // ========================================
-    // Q,K,V,O LoRA-MoE Forward (간단화: Q만 사용)
-    // 전체 attention은 계산 비용이 크므로 Q projection만 학습
+    // Q,K,V,O LoRA-MoE Forward
     // ========================================
     struct ggml_tensor * q_lora = build_moe_soft_routing(
         ggml_ctx, ctx->inp, layer.router_probs,
@@ -461,13 +415,13 @@ bool build_attn_moe_train_graph(
         layer.o.lora_a, layer.o.lora_b, lora_scale);
     ggml_set_name(o_lora, "o_lora");
 
-    // 전체 LoRA 출력 합산 (간단화된 버전)
+    // sum all LoRA outputs
     struct ggml_tensor * lora_sum = ggml_add(ggml_ctx, q_lora,
         ggml_add(ggml_ctx, k_lora,
             ggml_add(ggml_ctx, v_lora, o_lora)));
     ggml_set_name(lora_sum, "lora_sum");
 
-    // Residual 연결
+    // residual connection
     struct ggml_tensor * pred = ggml_add(ggml_ctx, ctx->inp, lora_sum);
     ggml_set_name(pred, "pred");
 
@@ -491,7 +445,7 @@ bool build_attn_moe_train_graph(
     ggml_set_loss(ctx->total_loss);
 
     // ========================================
-    // Forward Graph 빌드
+    // Build forward graph
     // ========================================
     ctx->gf = ggml_new_graph_custom(ggml_ctx, 8192, true);
     ggml_build_forward_expand(ctx->gf, ctx->total_loss);
@@ -499,7 +453,7 @@ bool build_attn_moe_train_graph(
     int n_fwd_nodes = ggml_graph_n_nodes(ctx->gf);
 
     // ========================================
-    // Gradient Accumulators 할당
+    // Allocate gradient accumulators
     // ========================================
     std::vector<struct ggml_tensor *> grad_accs(n_fwd_nodes, nullptr);
 
@@ -509,7 +463,7 @@ bool build_attn_moe_train_graph(
             grad_accs[i] = ggml_new_tensor(ggml_ctx, GGML_TYPE_F32, GGML_MAX_DIMS, node->ne);
             ggml_format_name(grad_accs[i], "%s_grad", node->name);
 
-            // Gradient 텐서 연결
+            // link gradient tensors
             if (node == layer.q.lora_a) layer.q.grad_a = grad_accs[i];
             else if (node == layer.q.lora_b) layer.q.grad_b = grad_accs[i];
             else if (node == layer.k.lora_a) layer.k.grad_a = grad_accs[i];
@@ -524,7 +478,7 @@ bool build_attn_moe_train_graph(
     }
 
     // ========================================
-    // Backward Graph 빌드
+    // Build backward graph
     // ========================================
     ctx->gb = ggml_graph_dup(ggml_ctx, ctx->gf, true);
     ggml_build_backward_expand(ggml_ctx, ctx->gb, grad_accs.data());
@@ -539,7 +493,7 @@ bool build_attn_moe_train_graph(
 }
 
 // ============================================================================
-// Debug 유틸리티
+// Debug utilities
 // ============================================================================
 
 void debug_tensor_stats(

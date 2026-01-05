@@ -134,7 +134,7 @@ int main(int argc, char ** argv) {
     }
 
     // ========================================
-    // 3. 토큰화 및 데이터 준비
+    // 3. Tokenization and data preparation
     // ========================================
     std::vector<llama_token> tokens = common_tokenize(ctx, params.prompt, true);
     LOG_INF("%s: %zu tokens\n", __func__, tokens.size());
@@ -154,7 +154,7 @@ int main(int argc, char ** argv) {
     }
 
     // ========================================
-    // 4. 학습 설정
+    // 4. Training setup
     // ========================================
     int total_epochs = 10;
     float initial_loss = compute_loss(ctx, tokens, params.n_batch);
@@ -162,11 +162,11 @@ int main(int argc, char ** argv) {
 
     if (g_train_mode == TrainMode::ATTN_MOE) {
         // ========================================
-        // 4A. Attention MoE (LoRA-Mixer) 학습
+        // 4A. Attention MoE (LoRA-Mixer) training
         // ========================================
         LOG_INF("\n=== Attention MoE Training (LoRA-Mixer Style) ===\n");
 
-        // 모델에서 동적으로 파라미터 가져오기
+        // get parameters from model dynamically
         const auto * lmodel = reinterpret_cast<const llama_model *>(model);
         int model_n_head = llama_model_n_head(model);
         int model_n_head_kv = llama_model_n_head_kv(model);
@@ -174,12 +174,12 @@ int main(int argc, char ** argv) {
 
         attn_moe_train_config attn_config = {};
         attn_config.n_layers = n_layers;
-        attn_config.n_experts = n_experts > 0 ? n_experts : 8;  // 모델에서 감지한 값 또는 기본값
+        attn_config.n_experts = n_experts > 0 ? n_experts : 8;  // detected from model or default
         attn_config.n_expert_used = 2;  // inference top-k
         attn_config.n_embd = n_embd;
-        attn_config.n_head = model_n_head;      // 모델에서 가져옴
-        attn_config.n_head_kv = model_n_head_kv; // 모델에서 가져옴
-        attn_config.head_dim = model_head_dim;  // 모델에서 가져옴
+        attn_config.n_head = model_n_head;
+        attn_config.n_head_kv = model_n_head_kv;
+        attn_config.head_dim = model_head_dim;
         attn_config.rank = rank > 0 ? rank : 16;
         attn_config.n_tokens = n_tokens;
         attn_config.epochs = total_epochs;
@@ -195,16 +195,16 @@ int main(int argc, char ** argv) {
             fprintf(stderr, "\rEpoch %2d/%d: training... ", epoch + 1, total_epochs);
             fflush(stderr);
 
-            // Hidden states 캡처
+            // capture hidden states
             bridge_run_capture_phase(ctx, lora, input_tokens, g_hidden_states, n_layers);
 
-            // CE gradient 계산
+            // compute CE gradient
             std::vector<float> initial_grad;
             bridge_compute_initial_ce_gradient(model, ctx, input_tokens, target_tokens,
                                                 n_tokens, initial_grad);
 
             // Progress callback
-            attn_config.progress_callback = [&](int ep, int layer_idx, float loss) {
+            attn_config.progress_callback = [&](int /*ep*/, int layer_idx, float loss) {
                 const char * spinner = "|/-\\";
                 fprintf(stderr, "\rEpoch %2d/%d: layer %2d/%d %c loss=%.4f ",
                         epoch + 1, total_epochs,
@@ -219,8 +219,8 @@ int main(int argc, char ** argv) {
                 return 1;
             }
 
-            // 학습된 weights를 GPU에 동기화
-            // adapter의 기존 버퍼 타입 사용 (GPU)
+            // sync trained weights to GPU
+            // use adapter's existing buffer type (GPU)
             ggml_backend_buffer_type_t buft = nullptr;
             if (!lora->bufs.empty()) {
                 buft = ggml_backend_buffer_get_type(lora->bufs[0].get());
@@ -232,14 +232,14 @@ int main(int argc, char ** argv) {
             sync_lora_mixer_to_adapter(lora, buft, n_layers, attn_config.n_experts,
                                         n_embd, attn_config.rank);
 
-            // Epoch별 loss 측정
+            // measure loss for this epoch
             llama_memory_clear(llama_get_memory(ctx), true);
             float epoch_loss = compute_loss(ctx, tokens, params.n_batch);
             fprintf(stderr, "\rEpoch %2d/%d: CE loss = %.4f          \n", epoch + 1, total_epochs, epoch_loss);
         }
     } else {
         // ========================================
-        // 4B. 기존 MoE FFN 학습 (Gradient Alignment)
+        // 4B. MoE FFN training (Gradient Alignment)
         // ========================================
         LOG_INF("\n=== MoE LoRA Training (Gradient Alignment) ===\n");
 
@@ -261,28 +261,15 @@ int main(int argc, char ** argv) {
             fprintf(stderr, "\rEpoch %2d/%d: training... ", epoch + 1, total_epochs);
             fflush(stderr);
 
-            // Hidden states 캡처
+            // capture hidden states
             bridge_run_capture_phase(ctx, lora, input_tokens, g_hidden_states, n_layers);
 
-            // CE gradient 계산
+            // compute CE gradient
             std::vector<float> initial_grad;
             bridge_compute_initial_ce_gradient(model, ctx, input_tokens, target_tokens,
                                                 n_tokens, initial_grad);
 
-            // DEBUG: CE gradient 통계 출력 (첫 epoch만)
-            if (epoch == 0) {
-                float grad_sum = 0.0f, grad_max = 0.0f, grad_min = 1e30f;
-                for (size_t i = 0; i < initial_grad.size(); i++) {
-                    float v = fabsf(initial_grad[i]);
-                    grad_sum += v;
-                    if (v > grad_max) grad_max = v;
-                    if (v < grad_min && v > 0) grad_min = v;
-                }
-                LOG_INF("[DEBUG] CE gradient: size=%zu, mean=%.6e, max=%.6e, min=%.6e\n",
-                        initial_grad.size(), grad_sum / initial_grad.size(), grad_max, grad_min);
-            }
-
-            // 레이어별 역전파 학습
+            // per-layer backprop training
             train_config.progress_callback = [&](int layer_idx) {
                 const char * spinner = "|/-\\";
                 fprintf(stderr, "\rEpoch %2d/%d: layer %2d/%d %c ",
@@ -297,7 +284,7 @@ int main(int argc, char ** argv) {
                 return 1;
             }
 
-            // Epoch별 loss 측정
+            // measure loss for this epoch
             llama_memory_clear(llama_get_memory(ctx), true);
             float epoch_loss = compute_loss(ctx, tokens, params.n_batch);
             fprintf(stderr, "\rEpoch %2d/%d: CE loss = %.4f          \n", epoch + 1, total_epochs, epoch_loss);
@@ -305,7 +292,7 @@ int main(int argc, char ** argv) {
     }
 
     // ========================================
-    // 6. 최종 결과
+    // 6. Final results
     // ========================================
     llama_memory_clear(llama_get_memory(ctx), true);
     float final_loss = compute_loss(ctx, tokens, params.n_batch);
@@ -313,12 +300,12 @@ int main(int argc, char ** argv) {
     LOG_INF("CE loss: %.4f -> %.4f (delta: %.4f)\n", initial_loss, final_loss, final_loss - initial_loss);
 
     // ========================================
-    // 8. 샘플 생성 테스트
+    // 8. Sample generation test
     // ========================================
     run_sample_test(ctx, "2025년 대한민국의 대통령은");
 
     // ========================================
-    // 9. LoRA 어댑터 저장
+    // 9. Save LoRA adapter
     // ========================================
     if (!save_lora_adapter(model, lora, params.out_file.c_str())) {
         LOG_WRN("%s: LoRA save failed\n", __func__);
