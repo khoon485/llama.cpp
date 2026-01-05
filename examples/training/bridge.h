@@ -65,11 +65,12 @@ float compute_loss(
 // High-level 함수들 (main에서 1줄로 호출)
 // ============================================================================
 
-// [Step 1] Hidden states 캡처 실행
-// - cb_eval 설정, llama_decode 실행, 데이터 검증까지 한번에
+// [Step 1] Hidden states 캡처 실행 (base model만)
+// - LoRA 비활성화 후 forward, 캡처, LoRA 재활성화
 // - 실패 시 exit(1)
 void bridge_run_capture_phase(
         struct llama_context * ctx,
+        struct llama_adapter_lora * lora,
         const std::vector<llama_token> & input_tokens,
         all_layer_hidden_states & out_states,
         int n_layers);

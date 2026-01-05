@@ -58,9 +58,33 @@ struct llama_adapter_lora_weight {
     llama_adapter_lora_weight(ggml_tensor * a, ggml_tensor * b) : a(a), b(b) {}
 };
 
+// LoRA-MoE weight 구조체 (Attention projection용)
+// 여러 expert의 LoRA weights + router
+struct llama_adapter_lora_moe_weight {
+    std::vector<ggml_tensor *> expert_a;  // n_experts개의 lora_a [in_dim, rank]
+    std::vector<ggml_tensor *> expert_b;  // n_experts개의 lora_b [rank, out_dim]
+    ggml_tensor * router_w = nullptr;     // [n_embd, n_experts]
+
+    int n_experts = 0;
+    int n_expert_used = 2;  // inference top-k
+
+    // get scale
+    float get_scale(float alpha, float adapter_scale) const {
+        if (expert_b.empty() || !expert_b[0]) return adapter_scale;
+        const float rank = (float) expert_b[0]->ne[0];
+        const float scale = alpha ? adapter_scale * alpha / rank : adapter_scale;
+        return scale;
+    }
+
+    llama_adapter_lora_moe_weight() = default;
+};
+
 struct llama_adapter_lora {
     // map tensor name to lora_a_b
     std::unordered_map<std::string, llama_adapter_lora_weight> ab_map;
+
+    // MoE LoRA weights (Attention projection용)
+    std::unordered_map<std::string, llama_adapter_lora_moe_weight> moe_map;
 
     std::vector<ggml_context_ptr> ctxs;
     std::vector<ggml_backend_buffer_ptr> bufs;
@@ -73,10 +97,18 @@ struct llama_adapter_lora {
     // activated lora (aLoRA)
     std::vector<llama_token> alora_invocation_tokens;
 
+    // MoE config
+    int moe_n_experts = 0;
+    int moe_n_expert_used = 2;
+    bool is_moe_lora = false;
+
     llama_adapter_lora() = default;
     ~llama_adapter_lora() = default;
 
     llama_adapter_lora_weight * get_weight(ggml_tensor * w);
+
+    // MoE weight 조회
+    llama_adapter_lora_moe_weight * get_moe_weight(ggml_tensor * w);
 };
 
 using llama_adapter_loras = std::unordered_map<llama_adapter_lora *, float>;

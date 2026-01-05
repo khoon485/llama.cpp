@@ -54,10 +54,10 @@ struct moe_lora_train_context {
     float lora_alpha;       // LoRA scaling factor
 
     // 입력/출력 텐서
-    struct ggml_tensor * inp;         // [hidden, n_tokens]
-    struct ggml_tensor * target;      // [hidden, n_tokens]
+    struct ggml_tensor * inp;         // [hidden, n_tokens] - 레이어 입력 hidden states
+    struct ggml_tensor * target;      // [hidden, n_tokens] - CE gradient from next layer
     struct ggml_tensor * loss;        // scalar
-    struct ggml_tensor * mse_loss;    // MSE loss (디버깅용)
+    struct ggml_tensor * ce_loss;     // alignment loss (디버깅용)
     struct ggml_tensor * aux_loss;    // Auxiliary loss (디버깅용)
 
     // Router weights (학습 대상)
@@ -65,10 +65,23 @@ struct moe_lora_train_context {
     struct ggml_tensor * grad_gate_w;
 
     // Expert별 LoRA 텐서 (학습 대상) - 3D 텐서
-    struct ggml_tensor * lora_a_3d;   // [hidden, rank, n_experts]
-    struct ggml_tensor * lora_b_3d;   // [rank, hidden, n_experts]
-    struct ggml_tensor * grad_a_3d;
-    struct ggml_tensor * grad_b_3d;
+    // ffn_down_exps용
+    struct ggml_tensor * lora_a_down;   // [hidden, rank, n_experts]
+    struct ggml_tensor * lora_b_down;   // [rank, hidden, n_experts]
+    struct ggml_tensor * grad_a_down;
+    struct ggml_tensor * grad_b_down;
+
+    // ffn_gate_exps용
+    struct ggml_tensor * lora_a_gate;   // [hidden, rank, n_experts]
+    struct ggml_tensor * lora_b_gate;   // [rank, hidden, n_experts]
+    struct ggml_tensor * grad_a_gate;
+    struct ggml_tensor * grad_b_gate;
+
+    // ffn_up_exps용
+    struct ggml_tensor * lora_a_up;     // [hidden, rank, n_experts]
+    struct ggml_tensor * lora_b_up;     // [rank, hidden, n_experts]
+    struct ggml_tensor * grad_a_up;
+    struct ggml_tensor * grad_b_up;
 
     // 중간 텐서
     struct ggml_tensor * router_logits;    // [n_experts, n_tokens]

@@ -39,8 +39,10 @@ bool build_moe_lora_train_graph(struct moe_lora_train_context * mctx, bool verbo
     ggml_set_input(mctx->inp);
     ggml_set_param(mctx->inp);  // gradient 계산용 (backprop chain)
 
+    // target: CE gradient from next layer [hidden, n_tokens]
+    // 이 gradient 방향으로 MoE 출력이 향하도록 학습
     mctx->target = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden_size, n_tokens);
-    ggml_set_name(mctx->target, "target");
+    ggml_set_name(mctx->target, "ce_grad_target");
     ggml_set_input(mctx->target);
 
     // ========================================
@@ -52,14 +54,34 @@ bool build_moe_lora_train_graph(struct moe_lora_train_context * mctx, bool verbo
 
     // ========================================
     // Expert별 LoRA 텐서 (학습 대상) - 3D
+    // ffn_down, ffn_gate, ffn_up 각각 분리
     // ========================================
-    mctx->lora_a_3d = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hidden_size, rank, n_experts);
-    ggml_set_name(mctx->lora_a_3d, "lora_a_3d");
-    ggml_set_param(mctx->lora_a_3d);
+    // ffn_down_exps
+    mctx->lora_a_down = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hidden_size, rank, n_experts);
+    ggml_set_name(mctx->lora_a_down, "lora_a_down");
+    ggml_set_param(mctx->lora_a_down);
 
-    mctx->lora_b_3d = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, rank, hidden_size, n_experts);
-    ggml_set_name(mctx->lora_b_3d, "lora_b_3d");
-    ggml_set_param(mctx->lora_b_3d);
+    mctx->lora_b_down = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, rank, hidden_size, n_experts);
+    ggml_set_name(mctx->lora_b_down, "lora_b_down");
+    ggml_set_param(mctx->lora_b_down);
+
+    // ffn_gate_exps
+    mctx->lora_a_gate = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hidden_size, rank, n_experts);
+    ggml_set_name(mctx->lora_a_gate, "lora_a_gate");
+    ggml_set_param(mctx->lora_a_gate);
+
+    mctx->lora_b_gate = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, rank, hidden_size, n_experts);
+    ggml_set_name(mctx->lora_b_gate, "lora_b_gate");
+    ggml_set_param(mctx->lora_b_gate);
+
+    // ffn_up_exps
+    mctx->lora_a_up = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hidden_size, rank, n_experts);
+    ggml_set_name(mctx->lora_a_up, "lora_a_up");
+    ggml_set_param(mctx->lora_a_up);
+
+    mctx->lora_b_up = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, rank, hidden_size, n_experts);
+    ggml_set_name(mctx->lora_b_up, "lora_b_up");
+    ggml_set_param(mctx->lora_b_up);
 
     // ========================================
     // Forward: Router
@@ -84,6 +106,7 @@ bool build_moe_lora_train_graph(struct moe_lora_train_context * mctx, bool verbo
 
     // ========================================
     // Forward: Expert LoRA (Batched approach)
+    // 3개 LoRA (down, gate, up) 각각 적용 후 합산
     // ========================================
     struct ggml_tensor * inp_3d_batch = ggml_cont(ctx, ggml_reshape_3d(ctx, mctx->inp, hidden_size, n_tokens, 1));
 
@@ -91,13 +114,32 @@ bool build_moe_lora_train_graph(struct moe_lora_train_context * mctx, bool verbo
         hidden_size, n_tokens, n_experts, 1));
     ggml_set_name(inp_for_batch, "inp_for_batch");
 
-    struct ggml_tensor * tmp_batched = ggml_mul_mat(ctx, mctx->lora_a_3d, inp_for_batch);
-    ggml_set_name(tmp_batched, "tmp_batched");
+    // ffn_down LoRA: lora_a_down [hidden, rank, experts], inp [hidden, tokens, experts]
+    // mul_mat: [rank, tokens, experts] = lora_a_down^T @ inp
+    struct ggml_tensor * tmp_down = ggml_mul_mat(ctx, mctx->lora_a_down, inp_for_batch);
+    ggml_set_name(tmp_down, "tmp_down");
+    // lora_b_down [rank, hidden, experts], tmp [rank, tokens, experts]
+    // mul_mat: [hidden, tokens, experts] = lora_b_down^T @ tmp
+    struct ggml_tensor * lora_down = ggml_mul_mat(ctx, mctx->lora_b_down, tmp_down);
+    lora_down = ggml_cont(ctx, ggml_permute(ctx, lora_down, 0, 2, 1, 3));
+    ggml_set_name(lora_down, "lora_down");
 
-    struct ggml_tensor * lora_out = ggml_mul_mat(ctx, mctx->lora_b_3d, tmp_batched);
-    ggml_set_name(lora_out, "lora_out_batched");
+    // ffn_gate LoRA
+    struct ggml_tensor * tmp_gate = ggml_mul_mat(ctx, mctx->lora_a_gate, inp_for_batch);
+    ggml_set_name(tmp_gate, "tmp_gate");
+    struct ggml_tensor * lora_gate_out = ggml_mul_mat(ctx, mctx->lora_b_gate, tmp_gate);
+    lora_gate_out = ggml_cont(ctx, ggml_permute(ctx, lora_gate_out, 0, 2, 1, 3));
+    ggml_set_name(lora_gate_out, "lora_gate_out");
 
-    lora_out = ggml_cont(ctx, ggml_permute(ctx, lora_out, 0, 2, 1, 3));
+    // ffn_up LoRA
+    struct ggml_tensor * tmp_up = ggml_mul_mat(ctx, mctx->lora_a_up, inp_for_batch);
+    ggml_set_name(tmp_up, "tmp_up");
+    struct ggml_tensor * lora_up = ggml_mul_mat(ctx, mctx->lora_b_up, tmp_up);
+    lora_up = ggml_cont(ctx, ggml_permute(ctx, lora_up, 0, 2, 1, 3));
+    ggml_set_name(lora_up, "lora_up");
+
+    // 3개 LoRA 출력 합산
+    struct ggml_tensor * lora_out = ggml_add(ctx, lora_down, ggml_add(ctx, lora_gate_out, lora_up));
     ggml_set_name(lora_out, "lora_out");
 
     // ========================================
@@ -125,11 +167,20 @@ bool build_moe_lora_train_graph(struct moe_lora_train_context * mctx, bool verbo
     ggml_set_name(pred, "pred");
 
     // ========================================
-    // Loss: 내적 (진짜 CE backprop)
+    // Loss: Gradient Alignment
+    // MoE 출력(moe_out)이 CE gradient(target) 방향과 일치하도록 학습
+    // loss = -dot(moe_out, target)
+    // gradient descent는 loss를 줄이므로, dot product를 음수로 → moe_out이 target 방향으로 향함
     // ========================================
-    struct ggml_tensor * prod = ggml_mul(ctx, moe_out, mctx->target);
-    mctx->mse_loss = ggml_sum(ctx, prod);
-    ggml_set_name(mctx->mse_loss, "dot_loss");
+    // moe_out: [hidden, n_tokens], target: [hidden, n_tokens]
+    // elementwise multiply then sum = dot product
+    struct ggml_tensor * alignment = ggml_mul(ctx, moe_out, mctx->target);
+    struct ggml_tensor * alignment_sum = ggml_sum(ctx, alignment);
+
+    // loss = -dot(moe_out, target)
+    // 음수를 만들어서 gradient descent가 dot product를 증가시키게 함
+    mctx->ce_loss = ggml_scale(ctx, alignment_sum, -1.0f);
+    ggml_set_name(mctx->ce_loss, "alignment_loss");
 
     // Auxiliary Loss
     struct ggml_tensor * probs_sq = ggml_sqr(ctx, mctx->router_probs);
@@ -139,7 +190,7 @@ bool build_moe_lora_train_graph(struct moe_lora_train_context * mctx, bool verbo
     ggml_set_name(mctx->aux_loss, "aux_loss");
 
     // Total Loss
-    mctx->loss = ggml_add(ctx, mctx->mse_loss, mctx->aux_loss);
+    mctx->loss = ggml_add(ctx, mctx->ce_loss, mctx->aux_loss);
     ggml_set_name(mctx->loss, "loss");
     ggml_set_output(mctx->loss);
     ggml_set_loss(mctx->loss);
@@ -166,10 +217,18 @@ bool build_moe_lora_train_graph(struct moe_lora_train_context * mctx, bool verbo
 
             if (node == mctx->gate_w) {
                 mctx->grad_gate_w = grad_accs[i];
-            } else if (node == mctx->lora_a_3d) {
-                mctx->grad_a_3d = grad_accs[i];
-            } else if (node == mctx->lora_b_3d) {
-                mctx->grad_b_3d = grad_accs[i];
+            } else if (node == mctx->lora_a_down) {
+                mctx->grad_a_down = grad_accs[i];
+            } else if (node == mctx->lora_b_down) {
+                mctx->grad_b_down = grad_accs[i];
+            } else if (node == mctx->lora_a_gate) {
+                mctx->grad_a_gate = grad_accs[i];
+            } else if (node == mctx->lora_b_gate) {
+                mctx->grad_b_gate = grad_accs[i];
+            } else if (node == mctx->lora_a_up) {
+                mctx->grad_a_up = grad_accs[i];
+            } else if (node == mctx->lora_b_up) {
+                mctx->grad_b_up = grad_accs[i];
             } else if (node == mctx->inp) {
                 mctx->grad_inp = grad_accs[i];
             }

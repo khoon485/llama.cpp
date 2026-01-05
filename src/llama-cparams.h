@@ -39,4 +39,9 @@ struct llama_cparams {
 
     ggml_backend_sched_eval_callback cb_eval;
     void * cb_eval_user_data;
+
+    // MoE LoRA training - extra graph nodes
+    bool     moe_lora_training;
+    uint32_t moe_lora_n_experts;
+    uint32_t moe_lora_n_layers;
 };

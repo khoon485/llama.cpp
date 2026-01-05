@@ -146,6 +146,28 @@ llama_adapter_lora_weight * llama_adapter_lora::get_weight(ggml_tensor * w) {
     return nullptr;
 }
 
+llama_adapter_lora_moe_weight * llama_adapter_lora::get_moe_weight(ggml_tensor * w) {
+    if (!is_moe_lora) {
+        return nullptr;
+    }
+
+    const std::string name(w->name);
+
+    const auto pos = moe_map.find(name);
+    if (pos != moe_map.end()) {
+        return &pos->second;
+    }
+
+    // Debug: log first few misses to see what tensor names look like
+    static int miss_count = 0;
+    if (miss_count < 5 && name.find("attn") != std::string::npos) {
+        LLAMA_LOG_INFO("get_moe_weight miss: '%s' (moe_map size=%zu)\n", name.c_str(), moe_map.size());
+        miss_count++;
+    }
+
+    return nullptr;
+}
+
 static void llama_adapter_lora_init_impl(llama_model & model, const char * path_lora, llama_adapter_lora & adapter) {
     LLAMA_LOG_INFO("%s: loading lora adapter from '%s' ...\n", __func__, path_lora);
 

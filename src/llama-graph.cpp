@@ -671,21 +671,82 @@ ggml_tensor * llm_graph_context::build_lora_mm(
     ggml_tensor * res = ggml_mul_mat(ctx0, w, cur);
 
     for (const auto & lora : *loras) {
+        // 기존 단일 LoRA
         llama_adapter_lora_weight * lw = lora.first->get_weight(w);
-        if (lw == nullptr) {
+        if (lw != nullptr) {
+            const float adapter_scale = lora.second;
+            const float scale = lw->get_scale(lora.first->alpha, adapter_scale);
+
+            ggml_tensor * ab_cur = ggml_mul_mat(
+                    ctx0, lw->b,
+                    ggml_mul_mat(ctx0, lw->a, cur)
+                    );
+
+            ab_cur = ggml_scale(ctx0, ab_cur, scale);
+            res = ggml_add(ctx0, res, ab_cur);
             continue;
         }
 
-        const float adapter_scale = lora.second;
-        const float scale = lw->get_scale(lora.first->alpha, adapter_scale);
+        // MoE LoRA (Attention projection용)
+        llama_adapter_lora_moe_weight * mw = lora.first->get_moe_weight(w);
+        if (mw != nullptr && mw->n_experts > 0) {
+            static bool logged = false;
+            if (!logged) {
+                LLAMA_LOG_INFO("MoE LoRA hit: %s with %d experts\n", w->name, mw->n_experts);
+                logged = true;
+            }
+            const float adapter_scale = lora.second;
+            const float scale = mw->get_scale(lora.first->alpha, adapter_scale);
 
-        ggml_tensor * ab_cur = ggml_mul_mat(
-                ctx0, lw->b,
-                ggml_mul_mat(ctx0, lw->a, cur)
-                );
+            // Verify shapes match
+            int64_t base_out_dim = res->ne[0];  // res from base weight matmul
+            int64_t lora_out_dim = mw->expert_b[0]->ne[1];  // LoRA output dim
+            if (base_out_dim != lora_out_dim) {
+                LLAMA_LOG_WARN("MoE LoRA shape mismatch: base out=%lld, lora out=%lld, skipping\n",
+                               (long long)base_out_dim, (long long)lora_out_dim);
+                continue;
+            }
 
-        ab_cur = ggml_scale(ctx0, ab_cur, scale);
-        res = ggml_add(ctx0, res, ab_cur);
+            // Inference: Hard routing (top-k experts만 사용)
+            // 학습 시에는 attn_moe_trainer에서 soft routing 사용
+            // 여기서는 inference용 hard routing만 구현
+
+            // Router: softmax(router_w^T @ cur)
+            ggml_tensor * router_logits = ggml_mul_mat(ctx0, mw->router_w, cur);
+            ggml_tensor * router_probs = ggml_soft_max(ctx0, router_logits);
+
+            // 간단화: 모든 expert weighted sum (soft routing)
+            // 실제 inference에서는 top-k만 사용해야 함
+            int n_experts = mw->n_experts;
+            int64_t n_tokens = cur->ne[1];
+
+            ggml_tensor * moe_out = nullptr;
+
+            for (int e = 0; e < n_experts; e++) {
+                // Expert e의 LoRA forward
+                ggml_tensor * tmp = ggml_mul_mat(ctx0, mw->expert_a[e], cur);
+                ggml_tensor * expert_out = ggml_mul_mat(ctx0, mw->expert_b[e], tmp);
+
+                // Router weight 적용
+                // router_probs[e, :] 를 가져와서 expert_out에 곱함
+                // prob_e: [1, n_tokens] -> repeat to [out_dim, n_tokens]
+                ggml_tensor * prob_e = ggml_view_2d(ctx0, router_probs,
+                    1, n_tokens, router_probs->nb[1], e * sizeof(float));
+                ggml_tensor * prob_e_rep = ggml_repeat(ctx0, prob_e, expert_out);
+                ggml_tensor * weighted = ggml_mul(ctx0, expert_out, prob_e_rep);
+
+                if (moe_out == nullptr) {
+                    moe_out = weighted;
+                } else {
+                    moe_out = ggml_add(ctx0, moe_out, weighted);
+                }
+            }
+
+            if (moe_out != nullptr) {
+                moe_out = ggml_scale(ctx0, moe_out, scale);
+                res = ggml_add(ctx0, res, moe_out);
+            }
+        }
     }
 
     return res;

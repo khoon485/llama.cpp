@@ -364,6 +364,9 @@ extern "C" {
         bool kv_unified;  // use a unified buffer across the input sequences when computing the attention
                           // try to disable when n_seq_max > 1 for improved performance when the sequences do not share a large prefix
                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
+        bool     moe_lora_training;   // MoE LoRA training mode - allocates extra compute buffer
+        uint32_t moe_lora_n_experts;  // number of MoE LoRA experts (for buffer size calculation)
+        uint32_t moe_lora_n_layers;   // number of layers with MoE LoRA
     };
 
     // model quantization parameters

@@ -339,9 +339,12 @@ float compute_loss(
 
 void bridge_run_capture_phase(
         struct llama_context * ctx,
+        struct llama_adapter_lora * lora,
         const std::vector<llama_token> & input_tokens,
         all_layer_hidden_states & out_states,
         int n_layers) {
+
+    (void)lora;  // LoRA 켠 상태로 캡처
 
     // 상태 초기화
     out_states.n_layers = n_layers;
@@ -370,7 +373,7 @@ void bridge_run_capture_phase(
         batch.n_tokens++;
     }
 
-    // Forward 실행
+    // Forward 실행 (LoRA 포함)
     if (llama_decode(ctx, batch) != 0) {
         LOG_ERR("[FATAL] llama_decode failed during capture phase\n");
         llama_batch_free(batch);

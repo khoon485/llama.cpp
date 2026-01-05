@@ -60,6 +60,11 @@ llama_context::llama_context(
     cparams.cb_eval           = params.cb_eval;
     cparams.cb_eval_user_data = params.cb_eval_user_data;
 
+    // MoE LoRA training params
+    cparams.moe_lora_training   = params.moe_lora_training;
+    cparams.moe_lora_n_experts  = params.moe_lora_n_experts;
+    cparams.moe_lora_n_layers   = params.moe_lora_n_layers;
+
     auto rope_scaling_type = params.rope_scaling_type;
     if (rope_scaling_type == LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED) {
         rope_scaling_type = hparams.rope_scaling_type_train;
@@ -1439,10 +1444,26 @@ void llama_context::output_reorder() {
 //
 
 uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
+    uint32_t base_nodes;
     if (model.arch == LLM_ARCH_QWEN3NEXT) {
-        return std::max<uint32_t>(n_tokens * 40, 32u * model.n_tensors());
+        base_nodes = std::max<uint32_t>(n_tokens * 40, 32u * model.n_tensors());
+    } else {
+        base_nodes = std::max<uint32_t>(1024u, 8u*model.n_tensors());
     }
-    return std::max<uint32_t>(1024u, 8u*model.n_tensors());
+
+    // MoE LoRA training: extra nodes for Q,K,V,O projections
+    // Per projection: (n_experts * 6 + 4) nodes
+    //   6 nodes per expert: mul_mat(a), mul_mat(b), view, repeat, mul, add
+    //   4 global nodes: router mul_mat, softmax, scale, final add
+    // 4 projections (Q,K,V,O) per layer
+    if (cparams.moe_lora_training && cparams.moe_lora_n_experts > 0) {
+        uint32_t nodes_per_proj = cparams.moe_lora_n_experts * 6 + 4;
+        uint32_t extra_nodes = nodes_per_proj * 4 * cparams.moe_lora_n_layers;
+        LLAMA_LOG_INFO("%s: MoE LoRA training - adding %u extra nodes (Q,K,V,O)\n", __func__, extra_nodes);
+        base_nodes += extra_nodes;
+    }
+
+    return base_nodes;
 }
 
 llm_graph_result * llama_context::get_gf_res_reserve() const {

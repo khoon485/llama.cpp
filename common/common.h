@@ -376,6 +376,9 @@ struct common_params {
     std::vector<llama_model_tensor_buft_override> tensor_buft_overrides;
 
     bool lora_init_without_apply = false; // only load lora to memory, but do not apply it to ctx (user can manually apply lora later using llama_adapter_lora_apply)
+    bool moe_lora_training = false; // MoE LoRA training mode - allocates extra compute buffer for MoE graph nodes
+    int  moe_lora_n_experts = 0;    // number of MoE LoRA experts
+    int  moe_lora_n_layers = 0;     // number of layers with MoE LoRA
     std::vector<common_adapter_lora_info> lora_adapters; // lora adapter path with user defined scale
 
     std::vector<common_control_vector_load_info> control_vectors; // control vector with user defined scale

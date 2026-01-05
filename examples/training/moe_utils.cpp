@@ -233,40 +233,22 @@ bool sync_moe_to_adapter(
     int n_experts = mctx->n_experts;
     bool success = true;
 
-    // 1. lora_a_3d
-    if (mctx->lora_a_3d) {
-        if (verbose) {
-            LOG_INF("Syncing lora_a_3d [%lld, %lld, %lld]...\n",
-                    (long long)mctx->lora_a_3d->ne[0],
-                    (long long)mctx->lora_a_3d->ne[1],
-                    (long long)mctx->lora_a_3d->ne[2]);
-        }
-
-        bool ok_down = sync_3d_to_adapter_sliced(mctx->lora_a_3d, adapter,
-                                                  "ffn_down_exps", layer_idx, n_experts, true);
-        bool ok_gate = sync_3d_to_adapter_sliced(mctx->lora_a_3d, adapter,
-                                                  "ffn_gate_exps", layer_idx, n_experts, true);
-        if (verbose && !ok_down && !ok_gate) {
-            LOG_WRN("  lora_a_3d: no matching adapter tensor found for layer %d\n", layer_idx);
-        }
+    // 1. ffn_down_exps
+    if (mctx->lora_a_down && mctx->lora_b_down) {
+        sync_3d_to_adapter_sliced(mctx->lora_a_down, adapter, "ffn_down_exps", layer_idx, n_experts, true);
+        sync_3d_to_adapter_sliced(mctx->lora_b_down, adapter, "ffn_down_exps", layer_idx, n_experts, false);
     }
 
-    // 2. lora_b_3d
-    if (mctx->lora_b_3d) {
-        if (verbose) {
-            LOG_INF("Syncing lora_b_3d [%lld, %lld, %lld]...\n",
-                    (long long)mctx->lora_b_3d->ne[0],
-                    (long long)mctx->lora_b_3d->ne[1],
-                    (long long)mctx->lora_b_3d->ne[2]);
-        }
+    // 2. ffn_gate_exps
+    if (mctx->lora_a_gate && mctx->lora_b_gate) {
+        sync_3d_to_adapter_sliced(mctx->lora_a_gate, adapter, "ffn_gate_exps", layer_idx, n_experts, true);
+        sync_3d_to_adapter_sliced(mctx->lora_b_gate, adapter, "ffn_gate_exps", layer_idx, n_experts, false);
+    }
 
-        bool ok_down = sync_3d_to_adapter_sliced(mctx->lora_b_3d, adapter,
-                                                  "ffn_down_exps", layer_idx, n_experts, false);
-        bool ok_gate = sync_3d_to_adapter_sliced(mctx->lora_b_3d, adapter,
-                                                  "ffn_gate_exps", layer_idx, n_experts, false);
-        if (verbose && !ok_down && !ok_gate) {
-            LOG_WRN("  lora_b_3d: no matching adapter tensor found for layer %d\n", layer_idx);
-        }
+    // 3. ffn_up_exps
+    if (mctx->lora_a_up && mctx->lora_b_up) {
+        sync_3d_to_adapter_sliced(mctx->lora_a_up, adapter, "ffn_up_exps", layer_idx, n_experts, true);
+        sync_3d_to_adapter_sliced(mctx->lora_b_up, adapter, "ffn_up_exps", layer_idx, n_experts, false);
     }
 
     // 3. gate_w (router)
