@@ -15,21 +15,22 @@
 // Attention MoE 학습 설정
 // ============================================================================
 struct attn_moe_train_config {
-    int n_layers;           // 학습할 레이어 수
-    int n_experts;          // expert 수
+    int n_layers;           // number of layers to train
+    int n_experts;          // number of experts
     int n_expert_used;      // inference top-k
     int n_embd;             // hidden dimension
     int n_head;             // attention heads
     int n_head_kv;          // KV heads (GQA)
-    int head_dim;           // head dimension (동적으로 모델에서 가져옴)
+    int head_dim;           // head dimension (from model)
     int rank;               // LoRA rank
-    int n_tokens;           // 토큰 수
-    int epochs;             // 전체 학습 epoch 수
+    int n_tokens;           // number of tokens
+    int epochs;             // total training epochs
     float lr;               // learning rate
     float lora_alpha;       // LoRA alpha (scaling)
-    float rsl_weight;       // RSL loss 가중치
+    float rsl_alpha;        // RSL balance loss weight (default 1.0)
+    float rsl_lambda;       // RSL entropy penalty weight (default 0.1)
 
-    // 프로그레스 콜백
+    // progress callback
     std::function<void(int epoch, int layer, float loss)> progress_callback;
 };
 

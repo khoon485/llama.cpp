@@ -155,11 +155,13 @@ struct ggml_tensor * build_moe_soft_routing(
     struct ggml_tensor * lora_b,        // [rank, out_dim, n_experts]
     float scale);
 
-// RSL Loss 계산: Route-Specialization Balance
-// -H(avg_probs) + mean(H(probs_per_token))
+/// RSL Loss: Route-Specialization Balance from LoRA-Mixer paper
+// L_RSL = α · balance_loss - λ · mean_entropy
 struct ggml_tensor * build_rsl_loss(
     struct ggml_context * ggml_ctx,
-    struct ggml_tensor * router_probs);  // [n_experts, n_tokens]
+    struct ggml_tensor * router_probs,  // [n_experts, n_tokens]
+    float alpha = 1.0f,                 // balance loss weight
+    float lambda = 0.1f);               // entropy penalty weight
 
 // Cross-Entropy Loss 계산
 struct ggml_tensor * build_ce_loss(

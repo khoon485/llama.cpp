@@ -1,5 +1,5 @@
-// lora_utils.h - 범용 LoRA 어댑터 유틸리티 (MoE 무관)
-// 저장, 정보 출력, rank/layer 탐지 등 재사용 가능한 함수들
+// lora_utils.h - General-purpose LoRA adapter utilities
+// Save, print info, detect rank/layer, GGUF metadata reading
 #pragma once
 
 #include "llama.h"
@@ -11,19 +11,31 @@
 #include <string>
 
 // ============================================================================
-// LoRA 어댑터 정보/탐지
+// GGUF Metadata Reading (before model/adapter load)
 // ============================================================================
 
-// LoRA 어댑터의 텐서 정보 출력
+// Read n_layer (block_count) from model GGUF file
+// Returns 0 on failure
+int read_model_n_layer(const char * model_path);
+
+// Read moe.n_experts from adapter GGUF metadata
+// Returns 0 if not found (non-MoE adapter)
+int read_adapter_moe_n_experts(const char * adapter_path);
+
+// ============================================================================
+// LoRA Adapter Info/Detection (after load)
+// ============================================================================
+
+// Print LoRA adapter tensor info
 void print_lora_adapter_info(struct llama_adapter_lora * adapter);
 
-// 어댑터에서 동적으로 rank 탐지
+// Detect rank from loaded adapter
 int detect_adapter_rank(struct llama_adapter_lora * adapter);
 
-// 어댑터에서 n_experts 탐지 (MoE 모델용)
+// Detect n_experts from loaded adapter tensor shapes
 int detect_adapter_n_experts(struct llama_adapter_lora * adapter);
 
-// 어댑터에서 n_layers 탐지
+// Detect n_layers from loaded adapter tensor names
 int detect_adapter_n_layers(struct llama_adapter_lora * adapter);
 
 // ============================================================================

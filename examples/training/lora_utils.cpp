@@ -1,4 +1,4 @@
-// lora_utils.cpp - 범용 LoRA 어댑터 유틸리티 구현
+// lora_utils.cpp - General-purpose LoRA adapter utilities
 #include "lora_utils.h"
 #include "log.h"
 #include "gguf.h"
@@ -7,7 +7,86 @@
 #include <cstring>
 
 // ============================================================================
-// LoRA 어댑터 정보/탐지
+// GGUF Metadata Reading (before model/adapter load)
+// ============================================================================
+
+int read_model_n_layer(const char * model_path) {
+    struct gguf_init_params params = { false, nullptr };
+    struct gguf_context * ctx = gguf_init_from_file(model_path, params);
+    if (!ctx) {
+        LOG_ERR("read_model_n_layer: failed to open %s\n", model_path);
+        return 0;
+    }
+
+    int n_layer = 0;
+
+    // Try common architecture prefixes for block_count key
+    const char * arch_prefixes[] = {
+        "llama", "qwen2", "qwen3", "gpt", "mistral", "phi", "gemma", "deepseek", nullptr
+    };
+
+    for (int i = 0; arch_prefixes[i] != nullptr; i++) {
+        char key[128];
+        snprintf(key, sizeof(key), "%s.block_count", arch_prefixes[i]);
+        int64_t key_id = gguf_find_key(ctx, key);
+        if (key_id >= 0) {
+            n_layer = (int)gguf_get_val_u32(ctx, key_id);
+            break;
+        }
+    }
+
+    // Fallback: scan all keys for block_count
+    if (n_layer == 0) {
+        int n_kv = gguf_get_n_kv(ctx);
+        for (int i = 0; i < n_kv; i++) {
+            const char * key = gguf_get_key(ctx, i);
+            if (strstr(key, "block_count") != nullptr) {
+                n_layer = (int)gguf_get_val_u32(ctx, i);
+                break;
+            }
+        }
+    }
+
+    gguf_free(ctx);
+    return n_layer;
+}
+
+int read_adapter_moe_n_experts(const char * adapter_path) {
+    struct gguf_init_params params = { false, nullptr };
+    struct gguf_context * ctx = gguf_init_from_file(adapter_path, params);
+    if (!ctx) {
+        LOG_ERR("read_adapter_moe_n_experts: failed to open %s\n", adapter_path);
+        return 0;
+    }
+
+    int n_experts = 0;
+
+    // Check for moe.n_experts metadata key
+    int64_t key_id = gguf_find_key(ctx, "moe.n_experts");
+    if (key_id >= 0) {
+        n_experts = (int)gguf_get_val_u32(ctx, key_id);
+    }
+
+    // Fallback: scan tensor shapes for [*, *, n_experts] pattern
+    if (n_experts == 0) {
+        int n_tensors = gguf_get_n_tensors(ctx);
+        for (int i = 0; i < n_tensors; i++) {
+            const char * name = gguf_get_tensor_name(ctx, i);
+            // MoE LoRA tensors have expert dimension
+            if (strstr(name, "lora") && strstr(name, "attn")) {
+                // Cannot read tensor shape from metadata-only load
+                // This fallback will be handled after full adapter load
+                break;
+            }
+        }
+    }
+
+    gguf_free(ctx);
+    return n_experts;
+}
+
+// ============================================================================
+// LoRA Adapter Info/Detection (after load)
 // ============================================================================
 
 void print_lora_adapter_info(struct llama_adapter_lora * adapter) {
@@ -61,7 +140,7 @@ int detect_adapter_n_layers(struct llama_adapter_lora * adapter) {
 }
 
 // ============================================================================
-// LoRA 어댑터 저장
+// LoRA Adapter Saving
 // ============================================================================
 
 bool save_lora_adapter(
@@ -94,6 +173,12 @@ bool save_lora_adapter(
         gguf_set_val_f32(gguf_ctx, "adapter.lora.alpha", std::stof(alpha_buf));
     } else {
         gguf_set_val_f32(gguf_ctx, "adapter.lora.alpha", 32.0f);
+    }
+
+    // Save MoE metadata if this is a MoE LoRA adapter
+    if (adapter->moe_n_experts > 0) {
+        gguf_set_val_u32(gguf_ctx, "moe.n_experts", (uint32_t)adapter->moe_n_experts);
+        gguf_set_val_u32(gguf_ctx, "moe.n_expert_used", (uint32_t)adapter->moe_n_expert_used);
     }
 
     int n_tensors = 0;

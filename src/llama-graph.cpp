@@ -671,7 +671,6 @@ ggml_tensor * llm_graph_context::build_lora_mm(
     ggml_tensor * res = ggml_mul_mat(ctx0, w, cur);
 
     for (const auto & lora : *loras) {
-        // 기존 단일 LoRA
         llama_adapter_lora_weight * lw = lora.first->get_weight(w);
         if (lw != nullptr) {
             const float adapter_scale = lora.second;
@@ -687,14 +686,9 @@ ggml_tensor * llm_graph_context::build_lora_mm(
             continue;
         }
 
-        // MoE LoRA (Attention projection용)
+        // MoE LoRA (for attention projections)
         llama_adapter_lora_moe_weight * mw = lora.first->get_moe_weight(w);
         if (mw != nullptr && mw->n_experts > 0) {
-            static bool logged = false;
-            if (!logged) {
-                LLAMA_LOG_INFO("MoE LoRA hit: %s with %d experts\n", w->name, mw->n_experts);
-                logged = true;
-            }
             const float adapter_scale = lora.second;
             const float scale = mw->get_scale(lora.first->alpha, adapter_scale);
 
@@ -707,33 +701,55 @@ ggml_tensor * llm_graph_context::build_lora_mm(
                 continue;
             }
 
-            // Inference: Hard routing (top-k experts만 사용)
-            // 학습 시에는 attn_moe_trainer에서 soft routing 사용
-            // 여기서는 inference용 hard routing만 구현
+            // Inference: top-k hard routing with renormalized weights
+            // Uses ggml_set_rows to create sparse weight matrix with only top-k non-zero
 
             // Router: softmax(router_w^T @ cur)
+            // router_logits: [n_experts, n_tokens]
             ggml_tensor * router_logits = ggml_mul_mat(ctx0, mw->router_w, cur);
             ggml_tensor * router_probs = ggml_soft_max(ctx0, router_logits);
 
-            // 간단화: 모든 expert weighted sum (soft routing)
-            // 실제 inference에서는 top-k만 사용해야 함
             int n_experts = mw->n_experts;
+            int n_expert_used = mw->n_expert_used;
             int64_t n_tokens = cur->ne[1];
 
+            // Top-k selection
+            // selected_experts: [n_expert_used, n_tokens] (int32)
+            ggml_tensor * selected_experts = ggml_argsort_top_k(ctx0, router_probs, n_expert_used);
+
+            // Get top-k weights and renormalize
+            ggml_tensor * probs_3d = ggml_reshape_3d(ctx0, router_probs, 1, n_experts, n_tokens);
+            ggml_tensor * topk_weights = ggml_get_rows(ctx0, probs_3d, selected_experts);
+            // topk_weights: [1, n_expert_used, n_tokens]
+
+            // Renormalize
+            topk_weights = ggml_reshape_2d(ctx0, topk_weights, n_expert_used, n_tokens);
+            ggml_tensor * weights_sum = ggml_sum_rows(ctx0, topk_weights);
+            weights_sum = ggml_clamp(ctx0, weights_sum, 1e-6f, INFINITY);
+            weights_sum = ggml_repeat(ctx0, weights_sum, topk_weights);
+            topk_weights = ggml_div(ctx0, topk_weights, weights_sum);
+
+            // Create sparse weight matrix: [n_experts, n_tokens] with only top-k non-zero
+            ggml_tensor * sparse_weights = ggml_fill(ctx0, router_probs, 0.0f);
+            topk_weights = ggml_reshape_3d(ctx0, topk_weights, 1, n_expert_used, n_tokens);
+            sparse_weights = ggml_reshape_3d(ctx0, sparse_weights, 1, n_experts, n_tokens);
+            sparse_weights = ggml_set_rows(ctx0, sparse_weights, topk_weights, selected_experts);
+            sparse_weights = ggml_reshape_2d(ctx0, sparse_weights, n_experts, n_tokens);
+            // sparse_weights: [n_experts, n_tokens] with only top-k entries non-zero, renormalized
+
+            // Compute weighted sum using sparse weights
             ggml_tensor * moe_out = nullptr;
 
             for (int e = 0; e < n_experts; e++) {
-                // Expert e의 LoRA forward
+                // Expert e's LoRA forward: B @ (A @ cur)
                 ggml_tensor * tmp = ggml_mul_mat(ctx0, mw->expert_a[e], cur);
                 ggml_tensor * expert_out = ggml_mul_mat(ctx0, mw->expert_b[e], tmp);
 
-                // Router weight 적용
-                // router_probs[e, :] 를 가져와서 expert_out에 곱함
-                // prob_e: [1, n_tokens] -> repeat to [out_dim, n_tokens]
-                ggml_tensor * prob_e = ggml_view_2d(ctx0, router_probs,
-                    1, n_tokens, router_probs->nb[1], e * sizeof(float));
-                ggml_tensor * prob_e_rep = ggml_repeat(ctx0, prob_e, expert_out);
-                ggml_tensor * weighted = ggml_mul(ctx0, expert_out, prob_e_rep);
+                // Get weight for expert e: sparse_weights[e, :] -> [1, n_tokens]
+                ggml_tensor * weight_e = ggml_view_2d(ctx0, sparse_weights,
+                    1, n_tokens, sparse_weights->nb[1], e * sizeof(float));
+                ggml_tensor * weight_e_rep = ggml_repeat(ctx0, weight_e, expert_out);
+                ggml_tensor * weighted = ggml_mul(ctx0, expert_out, weight_e_rep);
 
                 if (moe_out == nullptr) {
                     moe_out = weighted;

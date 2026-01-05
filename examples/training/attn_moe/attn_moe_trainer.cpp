@@ -64,20 +64,6 @@ static struct ggml_tensor * build_lora_projection(
     return result;
 }
 
-// Build RSL loss
-static struct ggml_tensor * build_rsl_loss(
-    struct ggml_context * ctx,
-    struct ggml_tensor * router_probs,
-    float alpha) {
-
-    int n_tokens = router_probs->ne[1];
-    struct ggml_tensor * probs_sq = ggml_sqr(ctx, router_probs);
-    struct ggml_tensor * loss = ggml_sum(ctx, probs_sq);
-    loss = ggml_scale(ctx, loss, alpha / (float)n_tokens);
-    ggml_set_name(loss, "rsl_loss");
-    return loss;
-}
-
 bool run_attn_moe_training(
     struct llama_adapter_lora * lora,
     const all_layer_hidden_states & hidden_states,
@@ -164,7 +150,15 @@ bool run_attn_moe_training(
         // Loss
         struct ggml_tensor * alignment = ggml_mul(ctx, output, target);
         struct ggml_tensor * task_loss = ggml_scale(ctx, ggml_sum(ctx, alignment), -1.0f / (float)(n_embd * n_tokens));
-        struct ggml_tensor * rsl_loss = build_rsl_loss(ctx, router_probs, 0.1f);
+        struct ggml_tensor * rsl_loss = build_rsl_loss(ctx, router_probs, config.rsl_alpha, config.rsl_lambda);
+
+        fprintf(stderr, "[LOSS] task_loss shape: [%lld, %lld, %lld, %lld]\n",
+                (long long)task_loss->ne[0], (long long)task_loss->ne[1],
+                (long long)task_loss->ne[2], (long long)task_loss->ne[3]);
+        fprintf(stderr, "[LOSS] rsl_loss shape: [%lld, %lld, %lld, %lld]\n",
+                (long long)rsl_loss->ne[0], (long long)rsl_loss->ne[1],
+                (long long)rsl_loss->ne[2], (long long)rsl_loss->ne[3]);
+
         struct ggml_tensor * loss = ggml_add(ctx, task_loss, rsl_loss);
         ggml_set_name(loss, "total_loss");
         ggml_set_output(loss);

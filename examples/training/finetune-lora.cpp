@@ -1,6 +1,5 @@
-// finetune-lora.cpp - LoRA-only fine-tuning for MoE models
-// V6: Attention MoE (LoRA-Mixer) 모드 추가
-// MoE FFN 모드와 Attention MoE 모드 선택 가능
+// finetune-lora.cpp - LoRA fine-tuning with 2-phase initialization
+// Supports both MoE FFN mode and Attention MoE (LoRA-Mixer) mode
 
 #include "arg.h"
 #include "common.h"
@@ -9,20 +8,17 @@
 #include "llama-adapter.h"
 #include "llama-model.h"
 
-// 분리된 모듈들
 #include "lora_utils.h"
 #include "moe_utils.h"
 #include "bridge.h"
 #include "moe_trainer.h"
 
-// Attention MoE (LoRA-Mixer 스타일)
 #include "attn_moe/attn_moe_graph.h"
 #include "attn_moe/attn_moe_trainer.h"
 
-// 학습 모드
 enum class TrainMode {
-    MOE_FFN,      // 기존: MoE FFN에 LoRA 적용
-    ATTN_MOE,     // 신규: Attention projection에 LoRA-MoE 적용
+    MOE_FFN,      // MoE FFN with LoRA
+    ATTN_MOE,     // Attention projection with LoRA-MoE
 };
 
 static TrainMode g_train_mode = TrainMode::MOE_FFN;
@@ -39,7 +35,7 @@ static TrainMode g_train_mode = TrainMode::MOE_FFN;
 
 int main(int argc, char ** argv) {
     // ========================================
-    // 1. 초기 설정 (파싱/모델 로드)
+    // Phase 1: Parse args and pre-scan GGUF files
     // ========================================
     common_params params;
     params.escape = false;
@@ -57,7 +53,7 @@ int main(int argc, char ** argv) {
     params.cache_type_k = GGML_TYPE_F32;
     params.cache_type_v = GGML_TYPE_F32;
 
-    // cb_eval 콜백 설정 (hidden states 캡처용)
+    // Hidden states capture callback
     static all_layer_hidden_states g_hidden_states;
     g_hidden_states.n_layers = 64;
     g_hidden_states.layer_input.resize(g_hidden_states.n_layers);
@@ -71,15 +67,36 @@ int main(int argc, char ** argv) {
     llama_backend_init();
     llama_numa_init(params.numa);
 
-    // ATTN_MOE 환경변수 체크 - MoE LoRA training이면 compute buffer를 미리 크게 잡음
-    // 추가 노드 = (n_experts * 6 + 4) * n_layers (Q projection만 사용 시)
+    // Check ATTN_MOE mode and pre-scan GGUF files for buffer sizing
     const char * attn_moe_env = std::getenv("ATTN_MOE");
     if (attn_moe_env && std::string(attn_moe_env) == "1") {
         params.moe_lora_training = true;
-        params.moe_lora_n_experts = 32;  // TODO: adapter에서 읽어오기
-        params.moe_lora_n_layers = 24;   // TODO: 모델에서 읽어오기
+        g_train_mode = TrainMode::ATTN_MOE;
+
+        // Pre-scan model GGUF for n_layer
+        int n_layer = read_model_n_layer(params.model.path.c_str());
+        if (n_layer == 0) {
+            LOG_WRN("Failed to read n_layer from model, using default 24\n");
+            n_layer = 24;
+        }
+
+        // Pre-scan adapter GGUF for n_experts
+        int n_experts = read_adapter_moe_n_experts(params.lora_adapters[0].path.c_str());
+        if (n_experts == 0) {
+            LOG_WRN("Failed to read n_experts from adapter, using default 32\n");
+            n_experts = 32;
+        }
+
+        params.moe_lora_n_layers = n_layer;
+        params.moe_lora_n_experts = n_experts;
+
+        LOG_INF("Pre-scan: n_layer=%d, n_experts=%d (for compute buffer sizing)\n",
+                n_layer, n_experts);
     }
 
+    // ========================================
+    // Phase 2: Initialize model and context with correct buffer sizes
+    // ========================================
     auto llama_init_result = common_init_from_params(params);
     auto * model = llama_init_result->model();
     auto * ctx   = llama_init_result->context();
@@ -99,7 +116,7 @@ int main(int argc, char ** argv) {
     struct llama_adapter_lora * lora = params.lora_adapters[0].ptr;
 
     // ========================================
-    // 2. 어댑터 정보 및 동적 파라미터 탐지
+    // Phase 3: Detect adapter parameters (post-load verification)
     // ========================================
     print_lora_adapter_info(lora);
     int rank = detect_adapter_rank(lora);
@@ -110,13 +127,9 @@ int main(int argc, char ** argv) {
     LOG_INF("Config: rank=%d, n_experts=%d, n_layers=%d, n_embd=%d\n",
             rank, n_experts, n_layers, n_embd);
 
-    // 학습 모드 결정 (환경변수 또는 adapter 타입으로)
-    // ATTN_MOE=1 환경변수로 Attention MoE 모드 활성화 (이미 위에서 체크됨)
-    if (params.moe_lora_training) {
-        g_train_mode = TrainMode::ATTN_MOE;
+    if (g_train_mode == TrainMode::ATTN_MOE) {
         LOG_INF("Training mode: ATTN_MOE (LoRA-Mixer style)\n");
     } else {
-        g_train_mode = TrainMode::MOE_FFN;
         LOG_INF("Training mode: MOE_FFN (Gradient Alignment)\n");
     }
 
@@ -172,7 +185,8 @@ int main(int argc, char ** argv) {
         attn_config.epochs = total_epochs;
         attn_config.lr = 1e-4f;
         attn_config.lora_alpha = 32.0f;
-        attn_config.rsl_weight = 0.01f;
+        attn_config.rsl_alpha = 1.0f;    // RSL balance loss weight
+        attn_config.rsl_lambda = 0.1f;   // RSL entropy penalty weight
 
         LOG_INF("Attn-MoE config: n_experts=%d, n_head=%d, n_head_kv=%d, head_dim=%d, rank=%d\n",
                 attn_config.n_experts, attn_config.n_head, attn_config.n_head_kv, attn_config.head_dim, attn_config.rank);

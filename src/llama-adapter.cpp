@@ -158,13 +158,6 @@ llama_adapter_lora_moe_weight * llama_adapter_lora::get_moe_weight(ggml_tensor *
         return &pos->second;
     }
 
-    // Debug: log first few misses to see what tensor names look like
-    static int miss_count = 0;
-    if (miss_count < 5 && name.find("attn") != std::string::npos) {
-        LLAMA_LOG_INFO("get_moe_weight miss: '%s' (moe_map size=%zu)\n", name.c_str(), moe_map.size());
-        miss_count++;
-    }
-
     return nullptr;
 }
 

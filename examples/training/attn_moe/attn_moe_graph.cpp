@@ -232,37 +232,76 @@ struct ggml_tensor * build_moe_soft_routing(
 
 struct ggml_tensor * build_rsl_loss(
     struct ggml_context * ggml_ctx,
-    struct ggml_tensor * router_probs) {  // [n_experts, n_tokens]
+    struct ggml_tensor * router_probs,  // [n_experts, n_tokens]
+    float alpha,                        // balance loss weight (default 1.0)
+    float lambda) {                     // entropy penalty weight (default 0.1)
 
     int n_experts = router_probs->ne[0];
+    int n_tokens = router_probs->ne[1];
 
-    // 간단화된 RSL Loss: Auxiliary Load Balancing Loss
-    // 원래 RSL은 entropy 기반이지만, ggml에 log 연산 제한이 있으므로
-    // 간단히 router probability의 제곱합을 사용하여 균등 분포 유도
+    // RSL Loss (Route-Specialization Balance) from LoRA-Mixer paper
 
-    // avg_probs = mean(router_probs, dim=tokens): [n_experts]
-    // ggml_mean은 전체 평균이므로 sum_rows 사용
-    struct ggml_tensor * sum_probs = ggml_sum_rows(ggml_ctx, ggml_cont(ggml_ctx, ggml_transpose(ggml_ctx, router_probs)));
-    // [1, n_experts]를 [n_experts]로 reshape
-    struct ggml_tensor * avg_probs = ggml_reshape_1d(ggml_ctx, sum_probs, n_experts);
-    ggml_set_name(avg_probs, "sum_probs");
+    fprintf(stderr, "[RSL] router_probs: [%lld, %lld, %lld, %lld]\n",
+            (long long)router_probs->ne[0], (long long)router_probs->ne[1],
+            (long long)router_probs->ne[2], (long long)router_probs->ne[3]);
 
-    // Load balancing loss: sum(avg_probs^2) - minimize하면 균등분포
-    // 최적값은 각 expert가 1/n_experts 확률일 때
-    struct ggml_tensor * probs_sq = ggml_sqr(ggml_ctx, avg_probs);
-    struct ggml_tensor * balance_loss = ggml_sum(ggml_ctx, probs_sq);
+    // Term 1: Load Balance Loss
+    struct ggml_tensor * probs_sq = ggml_sqr(ggml_ctx, router_probs);
+    fprintf(stderr, "[RSL] probs_sq: [%lld, %lld, %lld, %lld]\n",
+            (long long)probs_sq->ne[0], (long long)probs_sq->ne[1],
+            (long long)probs_sq->ne[2], (long long)probs_sq->ne[3]);
+
+    struct ggml_tensor * balance_sum = ggml_sum(ggml_ctx, probs_sq);
+    fprintf(stderr, "[RSL] balance_sum: [%lld, %lld, %lld, %lld]\n",
+            (long long)balance_sum->ne[0], (long long)balance_sum->ne[1],
+            (long long)balance_sum->ne[2], (long long)balance_sum->ne[3]);
+
+    struct ggml_tensor * balance_loss = ggml_scale(ggml_ctx, balance_sum, (float)n_experts / (float)n_tokens);
+    fprintf(stderr, "[RSL] balance_loss: [%lld, %lld, %lld, %lld]\n",
+            (long long)balance_loss->ne[0], (long long)balance_loss->ne[1],
+            (long long)balance_loss->ne[2], (long long)balance_loss->ne[3]);
     ggml_set_name(balance_loss, "balance_loss");
 
-    // Specialization loss: router probs의 entropy를 낮추면 specialization
-    // 간단히 -sum(probs * probs) 사용 (높을수록 confident)
-    struct ggml_tensor * router_sq = ggml_sqr(ggml_ctx, router_probs);
-    struct ggml_tensor * spec_loss = ggml_neg(ggml_ctx, ggml_sum(ggml_ctx, router_sq));
-    ggml_set_name(spec_loss, "spec_loss");
+    // Term 2: Entropy Regularizer
+    struct ggml_tensor * log_probs = ggml_log(ggml_ctx, router_probs);
+    fprintf(stderr, "[RSL] log_probs: [%lld, %lld, %lld, %lld]\n",
+            (long long)log_probs->ne[0], (long long)log_probs->ne[1],
+            (long long)log_probs->ne[2], (long long)log_probs->ne[3]);
 
-    // RSL = balance + 0.1 * specialization
-    struct ggml_tensor * rsl = ggml_add(ggml_ctx, balance_loss, ggml_scale(ggml_ctx, spec_loss, 0.1f));
+    struct ggml_tensor * p_log_p = ggml_mul(ggml_ctx, router_probs, log_probs);
+    fprintf(stderr, "[RSL] p_log_p: [%lld, %lld, %lld, %lld]\n",
+            (long long)p_log_p->ne[0], (long long)p_log_p->ne[1],
+            (long long)p_log_p->ne[2], (long long)p_log_p->ne[3]);
+
+    struct ggml_tensor * neg_entropy_sum = ggml_sum(ggml_ctx, p_log_p);
+    fprintf(stderr, "[RSL] neg_entropy_sum: [%lld, %lld, %lld, %lld]\n",
+            (long long)neg_entropy_sum->ne[0], (long long)neg_entropy_sum->ne[1],
+            (long long)neg_entropy_sum->ne[2], (long long)neg_entropy_sum->ne[3]);
+
+    struct ggml_tensor * mean_entropy = ggml_scale(ggml_ctx, neg_entropy_sum, -1.0f / n_tokens);
+    fprintf(stderr, "[RSL] mean_entropy: [%lld, %lld, %lld, %lld]\n",
+            (long long)mean_entropy->ne[0], (long long)mean_entropy->ne[1],
+            (long long)mean_entropy->ne[2], (long long)mean_entropy->ne[3]);
+    ggml_set_name(mean_entropy, "mean_entropy");
+
+    // Combined
+    struct ggml_tensor * scaled_balance = ggml_scale(ggml_ctx, balance_loss, alpha);
+    fprintf(stderr, "[RSL] scaled_balance: [%lld, %lld, %lld, %lld]\n",
+            (long long)scaled_balance->ne[0], (long long)scaled_balance->ne[1],
+            (long long)scaled_balance->ne[2], (long long)scaled_balance->ne[3]);
+
+    struct ggml_tensor * scaled_entropy = ggml_scale(ggml_ctx, mean_entropy, -lambda);
+    fprintf(stderr, "[RSL] scaled_entropy: [%lld, %lld, %lld, %lld]\n",
+            (long long)scaled_entropy->ne[0], (long long)scaled_entropy->ne[1],
+            (long long)scaled_entropy->ne[2], (long long)scaled_entropy->ne[3]);
+
+    struct ggml_tensor * rsl = ggml_add(ggml_ctx, scaled_balance, scaled_entropy);
+    fprintf(stderr, "[RSL] rsl: [%lld, %lld, %lld, %lld]\n",
+            (long long)rsl->ne[0], (long long)rsl->ne[1],
+            (long long)rsl->ne[2], (long long)rsl->ne[3]);
     ggml_set_name(rsl, "rsl_loss");
 
+    fprintf(stderr, "[RSL] build_rsl_loss done\n");
     return rsl;
 }
 
