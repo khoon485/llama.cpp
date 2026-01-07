@@ -204,7 +204,7 @@ bool save_lora_adapter(
 }
 
 // ============================================================================
-// 모델 텐서 접근 헬퍼
+// Model Tensor Access Helper
 // ============================================================================
 
 struct ggml_tensor * find_lm_head(const llama_model * model) {
@@ -215,9 +215,9 @@ struct ggml_tensor * find_lm_head(const llama_model * model) {
             return kv.second;
         }
     }
-    // Fail-Fast: lm_head 없으면 CE gradient 계산 불가
+    // Fail-Fast: CE gradient computation requires lm_head
     LOG_ERR("find_lm_head: FATAL - output.weight/lm_head tensor not found!\n");
-    LOG_ERR("  CE gradient 역전파에 lm_head가 필수입니다.\n");
-    LOG_ERR("  모델이 lm_head를 tok_embd와 공유하는 tied embedding 구조일 수 있습니다.\n");
+    LOG_ERR("  lm_head is required for CE gradient backpropagation.\n");
+    LOG_ERR("  Model may use tied embedding where lm_head shares weights with tok_embd.\n");
     return nullptr;
 }

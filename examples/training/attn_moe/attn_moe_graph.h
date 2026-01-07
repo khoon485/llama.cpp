@@ -207,3 +207,36 @@ void debug_tensor_stats(
     const char * name,
     struct ggml_tensor * t,
     ggml_backend_t backend);
+
+// ============================================================================
+// DPO (Direct Preference Optimization) Support
+// ============================================================================
+
+enum dpo_loss_type {
+    DPO_LOSS_SIGMOID,    // 기본 DPO: -log(sigmoid(β * (r_w - r_l)))
+    DPO_LOSS_HINGE,      // hinge: max(0, 1 - β * (r_w - r_l))
+    DPO_LOSS_IPO,        // IPO: (r_w - r_l - 1/2β)^2
+};
+
+struct dpo_config {
+    float beta;                       // temperature (default 0.1)
+    enum dpo_loss_type loss_type;
+    bool use_reference_free;          // ORPO style (no ref model)
+};
+
+// DPO loss 계산
+// logp = -cross_entropy (부호 주의)
+struct ggml_tensor * build_dpo_loss(
+    struct ggml_context * ctx,
+    struct ggml_tensor * logp_chosen,      // scalar: policy log prob chosen
+    struct ggml_tensor * logp_rejected,    // scalar: policy log prob rejected
+    struct ggml_tensor * ref_logp_chosen,  // scalar: ref model log prob (precomputed)
+    struct ggml_tensor * ref_logp_rejected,
+    const struct dpo_config * config);
+
+// Reference-free DPO (ORPO style)
+struct ggml_tensor * build_dpo_loss_ref_free(
+    struct ggml_context * ctx,
+    struct ggml_tensor * logp_chosen,
+    struct ggml_tensor * logp_rejected,
+    float beta);

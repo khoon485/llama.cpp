@@ -9,9 +9,9 @@
 #include "llama-model.h"
 
 #include "lora_utils.h"
-#include "moe_utils.h"
+#include "ffn_moe/moe_utils.h"
 #include "bridge.h"
-#include "moe_trainer.h"
+#include "ffn_moe/moe_trainer.h"
 
 #include "attn_moe/attn_moe_graph.h"
 #include "attn_moe/attn_moe_trainer.h"

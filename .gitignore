@@ -137,3 +137,9 @@ poetry.toml
 /.windsurf/
 # emscripten
 a.out.*
+
+# Training data/logs
+*.jsonl
+*_backup_*
+*.txt
+examples/training/__pycache__/

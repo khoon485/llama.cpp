@@ -1,6 +1,6 @@
-// moe_utils.cpp - MoE 전용 유틸리티 함수 구현
+// moe_utils.cpp - MoE utility functions implementation
 #include "moe_utils.h"
-#include "moe_graph.h"  // moe_lora_train_context 정의
+#include "moe_graph.h"  // moe_lora_train_context definition
 #include "log.h"
 
 #include <cstring>
@@ -102,7 +102,7 @@ bool copy_3d_to_experts(
 }
 
 // ============================================================================
-// MoE LoRA 텐서 탐색
+// MoE LoRA Tensor Search
 // ============================================================================
 
 bool find_moe_lora_tensors(
@@ -135,7 +135,7 @@ bool find_moe_lora_tensors(
 }
 
 // ============================================================================
-// MoE 어댑터 동기화
+// MoE Adapter Synchronization
 // ============================================================================
 
 bool sync_3d_to_adapter_sliced(
@@ -175,7 +175,7 @@ bool sync_3d_to_adapter_sliced(
 
             if (!target) continue;
 
-            // 디버그: 첫 레이어만 shape 출력
+            // Debug: print shape only for first layer
             static bool debug_once = true;
             if (debug_once && layer_idx == 23) {
                 LOG_INF("DEBUG sync: pattern=%s, target=[%lld,%lld,%lld], trained=[%lld,%lld,%lld]\n",
@@ -185,7 +185,7 @@ bool sync_3d_to_adapter_sliced(
                 debug_once = false;
             }
 
-            // Case 1: 어댑터도 3D 텐서
+            // Case 1: adapter is also 3D tensor
             if (target->ne[2] == n_experts) {
                 if (ggml_nelements(target) == ggml_nelements(trained_3d)) {
                     if (target->type == GGML_TYPE_F16) {
@@ -200,7 +200,7 @@ bool sync_3d_to_adapter_sliced(
                     synced_count++;
                 }
             }
-            // Case 2: 어댑터가 2D 텐서
+            // Case 2: adapter is 2D tensor
             else if (target->ne[2] == 1 && ggml_nelements(target) == slice_elements) {
                 if (target->type == GGML_TYPE_F16) {
                     std::vector<ggml_fp16_t> f16_slice(slice_elements);

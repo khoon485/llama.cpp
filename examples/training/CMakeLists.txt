@@ -9,10 +9,11 @@ add_executable(${TARGET}
     finetune-lora.cpp
     optimizer.cpp
     lora_utils.cpp
-    moe_utils.cpp
-    moe_graph.cpp
     bridge.cpp
-    moe_trainer.cpp
+    # FFN MoE (gradient 문제로 격리됨)
+    ffn_moe/moe_utils.cpp
+    ffn_moe/moe_graph.cpp
+    ffn_moe/moe_trainer.cpp
     # Attention MoE (LoRA-Mixer 스타일)
     attn_moe/attn_moe_graph.cpp
     attn_moe/attn_moe_storage.cpp

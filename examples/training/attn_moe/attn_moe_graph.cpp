@@ -517,3 +517,77 @@ void debug_tensor_stats(
     LOG_INF("[DEBUG] %s: n=%zu, mean=%.6e, min=%.6e, max=%.6e\n",
             name, n, sum / n, min_val, max_val);
 }
+
+// ============================================================================
+// DPO (Direct Preference Optimization) Loss
+// ============================================================================
+
+struct ggml_tensor * build_dpo_loss(
+    struct ggml_context * ctx,
+    struct ggml_tensor * logp_chosen,
+    struct ggml_tensor * logp_rejected,
+    struct ggml_tensor * ref_logp_chosen,
+    struct ggml_tensor * ref_logp_rejected,
+    const struct dpo_config * config) {
+
+    // reward = log_policy - log_ref
+    struct ggml_tensor * reward_chosen = ggml_sub(ctx, logp_chosen, ref_logp_chosen);
+    ggml_set_name(reward_chosen, "reward_chosen");
+
+    struct ggml_tensor * reward_rejected = ggml_sub(ctx, logp_rejected, ref_logp_rejected);
+    ggml_set_name(reward_rejected, "reward_rejected");
+
+    // reward_diff = reward_chosen - reward_rejected
+    struct ggml_tensor * reward_diff = ggml_sub(ctx, reward_chosen, reward_rejected);
+    ggml_set_name(reward_diff, "reward_diff");
+
+    struct ggml_tensor * loss = nullptr;
+    float beta = config->beta;
+
+    switch (config->loss_type) {
+        case DPO_LOSS_SIGMOID: {
+            // L = -log(sigmoid(β * diff)) = softplus(-β * diff)
+            struct ggml_tensor * scaled = ggml_scale(ctx, reward_diff, -beta);
+            loss = ggml_softplus(ctx, scaled);
+            ggml_set_name(loss, "dpo_loss_sigmoid");
+            break;
+        }
+        case DPO_LOSS_HINGE: {
+            // L = max(0, 1 - β * diff) = relu(1 - β * diff)
+            struct ggml_tensor * scaled = ggml_scale(ctx, reward_diff, beta);
+            struct ggml_tensor * neg_scaled = ggml_scale(ctx, scaled, -1.0f);
+            struct ggml_tensor * ones = ggml_fill(ctx, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1), 1.0f);
+            struct ggml_tensor * margin = ggml_add(ctx, ones, neg_scaled);
+            loss = ggml_relu(ctx, margin);
+            ggml_set_name(loss, "dpo_loss_hinge");
+            break;
+        }
+        case DPO_LOSS_IPO: {
+            // L = (diff - 1/(2β))^2
+            float target = 0.5f / beta;
+            struct ggml_tensor * target_t = ggml_fill(ctx, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1), target);
+            struct ggml_tensor * centered = ggml_sub(ctx, reward_diff, target_t);
+            loss = ggml_sqr(ctx, centered);
+            ggml_set_name(loss, "dpo_loss_ipo");
+            break;
+        }
+    }
+
+    return loss;
+}
+
+struct ggml_tensor * build_dpo_loss_ref_free(
+    struct ggml_context * ctx,
+    struct ggml_tensor * logp_chosen,
+    struct ggml_tensor * logp_rejected,
+    float beta) {
+
+    // ORPO style: no reference model
+    // Just maximize margin between chosen and rejected
+    struct ggml_tensor * diff = ggml_sub(ctx, logp_chosen, logp_rejected);
+    struct ggml_tensor * scaled = ggml_scale(ctx, diff, -beta);
+    struct ggml_tensor * loss = ggml_softplus(ctx, scaled);
+    ggml_set_name(loss, "dpo_loss_ref_free");
+
+    return loss;
+}

@@ -1,4 +1,4 @@
-// moe_graph.cpp - MoE LoRA Training Graph Builder 구현
+// moe_graph.cpp - MoE LoRA Training Graph Builder implementation
 #include "moe_graph.h"
 
 #include <cstring>
@@ -15,7 +15,7 @@ bool build_moe_lora_train_graph(struct moe_lora_train_context * mctx, bool verbo
     int n_tokens = mctx->n_tokens;
     float lora_scale = mctx->lora_alpha / (float)rank;
 
-    (void)n_expert_used;  // unused warning 방지
+    (void)n_expert_used;  // suppress unused warning
 
     size_t ctx_size = 128 * 1024 * 1024;  // 128 MB
     struct ggml_init_params params = {
@@ -32,29 +32,29 @@ bool build_moe_lora_train_graph(struct moe_lora_train_context * mctx, bool verbo
     struct ggml_context * ctx = mctx->ctx;
 
     // ========================================
-    // 입력 텐서
+    // Input tensors
     // ========================================
     mctx->inp = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden_size, n_tokens);
     ggml_set_name(mctx->inp, "inp");
     ggml_set_input(mctx->inp);
-    ggml_set_param(mctx->inp);  // gradient 계산용 (backprop chain)
+    ggml_set_param(mctx->inp);  // for gradient computation (backprop chain)
 
     // target: CE gradient from next layer [hidden, n_tokens]
-    // 이 gradient 방향으로 MoE 출력이 향하도록 학습
+    // Train MoE output to align with this gradient direction
     mctx->target = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden_size, n_tokens);
     ggml_set_name(mctx->target, "ce_grad_target");
     ggml_set_input(mctx->target);
 
     // ========================================
-    // Router weights (학습 대상)
+    // Router weights (trainable)
     // ========================================
     mctx->gate_w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden_size, n_experts);
     ggml_set_name(mctx->gate_w, "gate_w");
     ggml_set_param(mctx->gate_w);
 
     // ========================================
-    // Expert별 LoRA 텐서 (학습 대상) - 3D
-    // ffn_down, ffn_gate, ffn_up 각각 분리
+    // Per-expert LoRA tensors (trainable) - 3D
+    // Separate ffn_down, ffn_gate, ffn_up
     // ========================================
     // ffn_down_exps
     mctx->lora_a_down = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hidden_size, rank, n_experts);
@@ -93,7 +93,7 @@ bool build_moe_lora_train_graph(struct moe_lora_train_context * mctx, bool verbo
     ggml_set_name(mctx->router_probs, "router_probs");
 
     // ========================================
-    // Forward: Top-k Masking (외부 입력 방식)
+    // Forward: Top-k Masking (external input)
     // ========================================
     mctx->topk_mask_input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_experts, n_tokens);
     ggml_set_name(mctx->topk_mask_input, "topk_mask_input");
@@ -106,7 +106,7 @@ bool build_moe_lora_train_graph(struct moe_lora_train_context * mctx, bool verbo
 
     // ========================================
     // Forward: Expert LoRA (Batched approach)
-    // 3개 LoRA (down, gate, up) 각각 적용 후 합산
+    // Apply 3 LoRAs (down, gate, up) separately then sum
     // ========================================
     struct ggml_tensor * inp_3d_batch = ggml_cont(ctx, ggml_reshape_3d(ctx, mctx->inp, hidden_size, n_tokens, 1));
 
@@ -138,7 +138,7 @@ bool build_moe_lora_train_graph(struct moe_lora_train_context * mctx, bool verbo
     lora_up = ggml_cont(ctx, ggml_permute(ctx, lora_up, 0, 2, 1, 3));
     ggml_set_name(lora_up, "lora_up");
 
-    // 3개 LoRA 출력 합산
+    // Sum 3 LoRA outputs
     struct ggml_tensor * lora_out = ggml_add(ctx, lora_down, ggml_add(ctx, lora_gate_out, lora_up));
     ggml_set_name(lora_out, "lora_out");
 
@@ -168,9 +168,9 @@ bool build_moe_lora_train_graph(struct moe_lora_train_context * mctx, bool verbo
 
     // ========================================
     // Loss: Gradient Alignment
-    // MoE 출력(moe_out)이 CE gradient(target) 방향과 일치하도록 학습
+    // Train MoE output (moe_out) to align with CE gradient (target)
     // loss = -dot(moe_out, target)
-    // gradient descent는 loss를 줄이므로, dot product를 음수로 → moe_out이 target 방향으로 향함
+    // Since gradient descent minimizes loss, negative dot product makes moe_out align with target
     // ========================================
     // moe_out: [hidden, n_tokens], target: [hidden, n_tokens]
     // elementwise multiply then sum = dot product
@@ -178,7 +178,7 @@ bool build_moe_lora_train_graph(struct moe_lora_train_context * mctx, bool verbo
     struct ggml_tensor * alignment_sum = ggml_sum(ctx, alignment);
 
     // loss = -dot(moe_out, target)
-    // 음수를 만들어서 gradient descent가 dot product를 증가시키게 함
+    // Negate so gradient descent increases the dot product
     mctx->ce_loss = ggml_scale(ctx, alignment_sum, -1.0f);
     ggml_set_name(mctx->ce_loss, "alignment_loss");
 
@@ -196,7 +196,7 @@ bool build_moe_lora_train_graph(struct moe_lora_train_context * mctx, bool verbo
     ggml_set_loss(mctx->loss);
 
     // ========================================
-    // Forward Graph 빌드
+    // Build Forward Graph
     // ========================================
     mctx->gf = ggml_new_graph_custom(ctx, 8192, true);
     ggml_build_forward_expand(mctx->gf, mctx->loss);
@@ -205,7 +205,7 @@ bool build_moe_lora_train_graph(struct moe_lora_train_context * mctx, bool verbo
     (void)n_fwd_nodes;  // suppress unused warning when verbose=false
 
     // ========================================
-    // Gradient Accumulators 할당
+    // Allocate Gradient Accumulators
     // ========================================
     std::vector<struct ggml_tensor *> grad_accs(n_fwd_nodes, nullptr);
 
@@ -236,7 +236,7 @@ bool build_moe_lora_train_graph(struct moe_lora_train_context * mctx, bool verbo
     }
 
     // ========================================
-    // Backward Graph 빌드
+    // Build Backward Graph
     // ========================================
     mctx->gb = ggml_graph_dup(ctx, mctx->gf, true);
     ggml_build_backward_expand(ctx, mctx->gb, grad_accs.data());
@@ -250,7 +250,7 @@ bool build_moe_lora_train_graph(struct moe_lora_train_context * mctx, bool verbo
 }
 
 // ============================================================================
-// 단순 LoRA 함수들
+// Simple LoRA Functions
 // ============================================================================
 
 struct ggml_tensor * build_simple_lora_forward(
@@ -353,6 +353,259 @@ bool build_simple_train_graph(
     LOG_INF("build_simple_train_graph: backward nodes=%d\n", ggml_graph_n_nodes(tctx->gb));
     LOG_INF("build_simple_train_graph: grad_a=%zu, grad_b=%zu\n",
             tctx->grad_a.size(), tctx->grad_b.size());
+
+    return true;
+}
+
+// ============================================================================
+// DPO (Direct Preference Optimization) Loss Functions
+// ============================================================================
+
+// log_softmax: log(softmax(x)) = x - log(sum(exp(x)))
+// 더 수치적으로 안정적인 버전: x - max(x) - log(sum(exp(x - max(x))))
+static struct ggml_tensor * build_log_softmax(
+        struct ggml_context * ctx,
+        struct ggml_tensor * logits) {  // [vocab, n_tokens]
+
+    // softmax 후 log 취하기
+    struct ggml_tensor * probs = ggml_soft_max(ctx, logits);
+    struct ggml_tensor * log_probs = ggml_log(ctx, probs);
+    return log_probs;
+}
+
+// logits [vocab, n_tokens]와 one-hot labels [vocab, n_tokens]로부터
+// 각 토큰의 log prob 추출: sum(log_probs * one_hot, dim=0) → [n_tokens]
+struct ggml_tensor * build_token_log_probs(
+        struct ggml_context * ctx,
+        struct ggml_tensor * logits,     // [vocab, n_tokens]
+        struct ggml_tensor * labels_onehot) {  // [vocab, n_tokens] one-hot encoded
+
+    struct ggml_tensor * log_probs = build_log_softmax(ctx, logits);
+    ggml_set_name(log_probs, "log_probs");
+
+    // element-wise multiply: log_probs * one_hot
+    struct ggml_tensor * masked = ggml_mul(ctx, log_probs, labels_onehot);
+
+    // sum over vocab dimension → [1, n_tokens] → reshape to [n_tokens]
+    struct ggml_tensor * token_logp = ggml_sum_rows(ctx, masked);
+    ggml_set_name(token_logp, "token_logp");
+
+    return token_logp;
+}
+
+// DPO Loss 계산
+// L_DPO = -log(sigmoid(β * (r_w - r_l)))
+//       = softplus(-β * (r_w - r_l))
+// 여기서 r = log π(y|x) - log π_ref(y|x)
+struct ggml_tensor * build_dpo_loss(
+        struct ggml_context * ctx,
+        struct ggml_tensor * policy_logp_chosen,    // scalar or [1] - sum of log probs
+        struct ggml_tensor * policy_logp_rejected,  // scalar or [1]
+        struct ggml_tensor * ref_logp_chosen,       // scalar or [1] (precomputed)
+        struct ggml_tensor * ref_logp_rejected,     // scalar or [1] (precomputed)
+        float beta,
+        enum dpo_loss_type loss_type) {
+
+    // reward_chosen = policy_logp_chosen - ref_logp_chosen
+    struct ggml_tensor * reward_chosen = ggml_sub(ctx, policy_logp_chosen, ref_logp_chosen);
+    ggml_set_name(reward_chosen, "reward_chosen");
+
+    // reward_rejected = policy_logp_rejected - ref_logp_rejected
+    struct ggml_tensor * reward_rejected = ggml_sub(ctx, policy_logp_rejected, ref_logp_rejected);
+    ggml_set_name(reward_rejected, "reward_rejected");
+
+    // reward_diff = reward_chosen - reward_rejected
+    struct ggml_tensor * reward_diff = ggml_sub(ctx, reward_chosen, reward_rejected);
+    ggml_set_name(reward_diff, "reward_diff");
+
+    struct ggml_tensor * loss = nullptr;
+
+    switch (loss_type) {
+        case DPO_LOSS_SIGMOID: {
+            // L = -log(sigmoid(β * diff)) = softplus(-β * diff)
+            struct ggml_tensor * scaled = ggml_scale(ctx, reward_diff, -beta);
+            loss = ggml_softplus(ctx, scaled);
+            ggml_set_name(loss, "dpo_loss_sigmoid");
+            break;
+        }
+        case DPO_LOSS_HINGE: {
+            // L = max(0, 1 - β * diff) = relu(1 - β * diff)
+            struct ggml_tensor * scaled = ggml_scale(ctx, reward_diff, beta);
+            struct ggml_tensor * neg_scaled = ggml_scale(ctx, scaled, -1.0f);
+            struct ggml_tensor * ones = ggml_fill(ctx, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1), 1.0f);
+            struct ggml_tensor * margin = ggml_add(ctx, ones, neg_scaled);
+            loss = ggml_relu(ctx, margin);
+            ggml_set_name(loss, "dpo_loss_hinge");
+            break;
+        }
+        case DPO_LOSS_IPO: {
+            // L = (diff - 1/(2β))^2
+            float target = 0.5f / beta;
+            struct ggml_tensor * target_t = ggml_fill(ctx, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1), target);
+            struct ggml_tensor * centered = ggml_sub(ctx, reward_diff, target_t);
+            loss = ggml_sqr(ctx, centered);
+            ggml_set_name(loss, "dpo_loss_ipo");
+            break;
+        }
+    }
+
+    return loss;
+}
+
+// Reference-free DPO (ORPO 스타일)
+// ref model 없이 length-normalized log prob 비교
+struct ggml_tensor * build_dpo_loss_reference_free(
+        struct ggml_context * ctx,
+        struct ggml_tensor * policy_logp_chosen,    // [1] - average log prob (length normalized)
+        struct ggml_tensor * policy_logp_rejected,  // [1]
+        float beta) {
+
+    // 단순히 chosen - rejected의 margin 최대화
+    struct ggml_tensor * diff = ggml_sub(ctx, policy_logp_chosen, policy_logp_rejected);
+    struct ggml_tensor * scaled = ggml_scale(ctx, diff, -beta);
+    struct ggml_tensor * loss = ggml_softplus(ctx, scaled);
+    ggml_set_name(loss, "dpo_loss_ref_free");
+
+    return loss;
+}
+
+// DPO Training Graph 빌드
+bool build_dpo_train_graph(struct dpo_train_context * dctx, bool verbose) {
+    int n_tokens_c = dctx->n_tokens_chosen;
+    int n_tokens_r = dctx->n_tokens_rejected;
+    int vocab_size = dctx->vocab_size;
+
+    size_t ctx_size = 256 * 1024 * 1024;  // 256 MB
+    struct ggml_init_params params = {
+        /*.mem_size   =*/ ctx_size,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    dctx->ctx = ggml_init(params);
+    if (!dctx->ctx) {
+        LOG_ERR("build_dpo_train_graph: failed to create ggml context\n");
+        return false;
+    }
+
+    struct ggml_context * ctx = dctx->ctx;
+
+    // ========================================
+    // Input tensors
+    // ========================================
+    // Policy model logits (from forward pass)
+    dctx->logits_chosen = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, vocab_size, n_tokens_c);
+    ggml_set_name(dctx->logits_chosen, "logits_chosen");
+    ggml_set_input(dctx->logits_chosen);
+
+    dctx->logits_rejected = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, vocab_size, n_tokens_r);
+    ggml_set_name(dctx->logits_rejected, "logits_rejected");
+    ggml_set_input(dctx->logits_rejected);
+
+    // One-hot encoded labels (precomputed on host)
+    dctx->labels_chosen = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, vocab_size, n_tokens_c);
+    ggml_set_name(dctx->labels_chosen, "labels_chosen_onehot");
+    ggml_set_input(dctx->labels_chosen);
+
+    dctx->labels_rejected = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, vocab_size, n_tokens_r);
+    ggml_set_name(dctx->labels_rejected, "labels_rejected_onehot");
+    ggml_set_input(dctx->labels_rejected);
+
+    // Reference model log probs (precomputed, frozen)
+    dctx->ref_logp_chosen = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+    ggml_set_name(dctx->ref_logp_chosen, "ref_logp_chosen");
+    ggml_set_input(dctx->ref_logp_chosen);
+
+    dctx->ref_logp_rejected = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+    ggml_set_name(dctx->ref_logp_rejected, "ref_logp_rejected");
+    ggml_set_input(dctx->ref_logp_rejected);
+
+    // ========================================
+    // Compute policy log probabilities
+    // ========================================
+    // Per-token log probs
+    struct ggml_tensor * token_logp_chosen = build_token_log_probs(ctx, dctx->logits_chosen, dctx->labels_chosen);
+    struct ggml_tensor * token_logp_rejected = build_token_log_probs(ctx, dctx->logits_rejected, dctx->labels_rejected);
+
+    // Sum over tokens to get sequence log prob
+    dctx->policy_logp_chosen = ggml_sum(ctx, token_logp_chosen);
+    ggml_set_name(dctx->policy_logp_chosen, "policy_logp_chosen");
+
+    dctx->policy_logp_rejected = ggml_sum(ctx, token_logp_rejected);
+    ggml_set_name(dctx->policy_logp_rejected, "policy_logp_rejected");
+
+    // ========================================
+    // Compute DPO Loss
+    // ========================================
+    if (dctx->use_reference_free) {
+        // Reference-free: length normalize
+        struct ggml_tensor * avg_logp_c = ggml_scale(ctx, dctx->policy_logp_chosen, 1.0f / n_tokens_c);
+        struct ggml_tensor * avg_logp_r = ggml_scale(ctx, dctx->policy_logp_rejected, 1.0f / n_tokens_r);
+        dctx->dpo_loss = build_dpo_loss_reference_free(ctx, avg_logp_c, avg_logp_r, dctx->beta);
+    } else {
+        dctx->dpo_loss = build_dpo_loss(
+            ctx,
+            dctx->policy_logp_chosen,
+            dctx->policy_logp_rejected,
+            dctx->ref_logp_chosen,
+            dctx->ref_logp_rejected,
+            dctx->beta,
+            dctx->loss_type);
+    }
+
+    // ========================================
+    // Compute reward margins for logging
+    // ========================================
+    dctx->chosen_rewards = ggml_sub(ctx, dctx->policy_logp_chosen, dctx->ref_logp_chosen);
+    ggml_set_name(dctx->chosen_rewards, "chosen_rewards");
+    ggml_set_output(dctx->chosen_rewards);
+
+    dctx->rejected_rewards = ggml_sub(ctx, dctx->policy_logp_rejected, dctx->ref_logp_rejected);
+    ggml_set_name(dctx->rejected_rewards, "rejected_rewards");
+    ggml_set_output(dctx->rejected_rewards);
+
+    // ========================================
+    // Total Loss
+    // ========================================
+    dctx->loss = dctx->dpo_loss;
+    ggml_set_name(dctx->loss, "loss");
+    ggml_set_output(dctx->loss);
+    ggml_set_loss(dctx->loss);
+
+    // ========================================
+    // Build Forward Graph
+    // ========================================
+    dctx->gf = ggml_new_graph_custom(ctx, 8192, true);
+    ggml_build_forward_expand(dctx->gf, dctx->loss);
+
+    int n_fwd_nodes = ggml_graph_n_nodes(dctx->gf);
+
+    if (verbose) {
+        LOG_INF("build_dpo_train_graph: vocab=%d, chosen_tokens=%d, rejected_tokens=%d\n",
+                vocab_size, n_tokens_c, n_tokens_r);
+        LOG_INF("build_dpo_train_graph: beta=%.3f, loss_type=%d, ref_free=%d\n",
+                dctx->beta, (int)dctx->loss_type, dctx->use_reference_free);
+        LOG_INF("build_dpo_train_graph: forward nodes=%d\n", n_fwd_nodes);
+    }
+
+    // ========================================
+    // Backward Graph (if training)
+    // ========================================
+    std::vector<struct ggml_tensor *> grad_accs(n_fwd_nodes, nullptr);
+
+    for (int i = 0; i < n_fwd_nodes; i++) {
+        struct ggml_tensor * node = ggml_graph_node(dctx->gf, i);
+        if ((node->flags & GGML_TENSOR_FLAG_PARAM) || (node->flags & GGML_TENSOR_FLAG_LOSS)) {
+            grad_accs[i] = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, node->ne);
+            ggml_format_name(grad_accs[i], "%s_grad", node->name);
+        }
+    }
+
+    dctx->gb = ggml_graph_dup(ctx, dctx->gf, true);
+    ggml_build_backward_expand(ctx, dctx->gb, grad_accs.data());
+
+    if (verbose) {
+        LOG_INF("build_dpo_train_graph: backward nodes=%d\n", ggml_graph_n_nodes(dctx->gb));
+    }
 
     return true;
 }

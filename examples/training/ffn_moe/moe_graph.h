@@ -123,3 +123,80 @@ bool build_simple_train_graph(
         int hidden_size,
         int rank,
         int n_tokens);
+
+// ============================================================================
+// DPO Training Context
+// ============================================================================
+enum dpo_loss_type {
+    DPO_LOSS_SIGMOID,    // 기본 DPO: -log(sigmoid(β * (r_w - r_l)))
+    DPO_LOSS_HINGE,      // hinge DPO: max(0, 1 - β * (r_w - r_l))
+    DPO_LOSS_IPO,        // IPO: (r_w - r_l - 1/2β)^2
+};
+
+struct dpo_train_context {
+    struct ggml_context * ctx;
+    struct ggml_cgraph  * gf;         // forward graph
+    struct ggml_cgraph  * gb;         // backward graph
+    ggml_backend_t        backend;
+    ggml_backend_buffer_t buf;
+
+    // DPO 설정
+    float beta;                       // DPO temperature (보통 0.1)
+    enum dpo_loss_type loss_type;     // loss 종류
+    bool use_reference_free;          // reference model 없이 학습 (ORPO 스타일)
+
+    int n_tokens_chosen;              // chosen 시퀀스 토큰 수
+    int n_tokens_rejected;            // rejected 시퀀스 토큰 수
+    int vocab_size;
+    int hidden_size;
+
+    // 입력 텐서
+    struct ggml_tensor * inp_chosen;      // [hidden, n_tokens_chosen] - chosen hidden states
+    struct ggml_tensor * inp_rejected;    // [hidden, n_tokens_rejected] - rejected hidden states
+    struct ggml_tensor * labels_chosen;   // [n_tokens_chosen] - chosen token labels (int32)
+    struct ggml_tensor * labels_rejected; // [n_tokens_rejected] - rejected token labels (int32)
+
+    // Reference model log probs (precomputed, frozen)
+    struct ggml_tensor * ref_logp_chosen;   // [n_tokens_chosen] - ref model log prob per token
+    struct ggml_tensor * ref_logp_rejected; // [n_tokens_rejected] - ref model log prob per token
+
+    // Policy model outputs (from lm_head)
+    struct ggml_tensor * logits_chosen;     // [vocab, n_tokens_chosen]
+    struct ggml_tensor * logits_rejected;   // [vocab, n_tokens_rejected]
+
+    // 중간 계산 결과
+    struct ggml_tensor * policy_logp_chosen;   // [n_tokens_chosen] - policy log prob per token
+    struct ggml_tensor * policy_logp_rejected; // [n_tokens_rejected]
+    struct ggml_tensor * chosen_rewards;       // scalar - sum of (policy - ref) for chosen
+    struct ggml_tensor * rejected_rewards;     // scalar - sum of (policy - ref) for rejected
+
+    // Loss 텐서
+    struct ggml_tensor * dpo_loss;    // scalar - DPO loss
+    struct ggml_tensor * loss;        // scalar - total loss (dpo + aux)
+
+    // 기존 MoE context 연결 (optional)
+    struct moe_lora_train_context * moe_ctx;
+};
+
+// ============================================================================
+// DPO Graph Builder 함수
+// ============================================================================
+
+// DPO loss 계산 (standalone)
+struct ggml_tensor * build_dpo_loss(
+        struct ggml_context * ctx,
+        struct ggml_tensor * policy_logp_chosen,
+        struct ggml_tensor * policy_logp_rejected,
+        struct ggml_tensor * ref_logp_chosen,
+        struct ggml_tensor * ref_logp_rejected,
+        float beta,
+        enum dpo_loss_type loss_type);
+
+// Log probability 계산 (logits + labels → log prob)
+struct ggml_tensor * build_token_log_probs(
+        struct ggml_context * ctx,
+        struct ggml_tensor * logits,    // [vocab, n_tokens]
+        struct ggml_tensor * labels);   // [n_tokens] int32
+
+// DPO Training Graph 빌드
+bool build_dpo_train_graph(struct dpo_train_context * dctx, bool verbose = true);

@@ -1,5 +1,5 @@
-// moe_trainer.cpp - MoE 레이어 역전파 학습 루프 구현
-// 2-Pass 구조: gradient 계산과 weight 업데이트 분리
+// moe_trainer.cpp - MoE layer backpropagation training loop
+// 2-Pass structure: separate gradient computation and weight update
 #include "moe_trainer.h"
 #include "moe_graph.h"
 #include "moe_utils.h"
@@ -15,7 +15,7 @@
 #include <vector>
 #include <string>
 
-// 레이어별 gradient 저장소 (Pass 1에서 계산, Pass 2에서 적용)
+// Per-layer gradient storage (computed in Pass 1, applied in Pass 2)
 struct layer_gradients {
     std::vector<float> grad_gate_w;
     std::vector<float> grad_a_down, grad_b_down;
@@ -24,21 +24,21 @@ struct layer_gradients {
     bool valid = false;
 };
 
-// 레이어별 Adam state 저장소 (epoch 간 유지)
+// Per-layer Adam state storage (persists across epochs)
 static std::vector<adam_state> s_adam_gate;
 static std::vector<adam_state> s_adam_a_down, s_adam_b_down;
 static std::vector<adam_state> s_adam_a_gate, s_adam_b_gate;
 static std::vector<adam_state> s_adam_a_up, s_adam_b_up;
 static int s_n_layers_initialized = 0;
 
-// 헬퍼: 텐서에서 gradient 읽어오기
+// Helper: read gradient from tensor
 static void read_gradient(struct ggml_tensor * t, std::vector<float> & out) {
     if (!t) return;
     out.resize(ggml_nelements(t));
     ggml_backend_tensor_get(t, out.data(), 0, ggml_nbytes(t));
 }
 
-// 헬퍼: 저장된 gradient를 텐서에 쓰기
+// Helper: write stored gradient to tensor
 static void write_gradient(struct ggml_tensor * t, const std::vector<float> & data) {
     if (!t || data.empty()) return;
     ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
@@ -57,7 +57,7 @@ bool run_moe_backprop_training(
 
     int n_layers = config.n_layers;
 
-    // Adam state 초기화 (최초 1회만)
+    // Initialize Adam state (once only)
     if (s_n_layers_initialized != n_layers) {
         s_adam_gate.resize(n_layers);
         s_adam_a_down.resize(n_layers);
@@ -70,11 +70,11 @@ bool run_moe_backprop_training(
         LOG_INF("Adam state initialized for %d layers\n", n_layers);
     }
 
-    // 레이어별 gradient 저장소
+    // Per-layer gradient storage
     std::vector<layer_gradients> all_grads(n_layers);
 
     // ========================================
-    // PASS 1: 모든 레이어 gradient 계산 (업데이트 없음)
+    // PASS 1: Compute gradients for all layers (no update)
     // ========================================
     std::vector<float> layer_grad = initial_grad;
 
@@ -151,7 +151,7 @@ bool run_moe_backprop_training(
                                 ggml_backend_tensor_get(w.b, b_data.data(), 0, ggml_nbytes(w.b));
                             }
 
-                            // LoRA B가 모두 0이면 gradient가 A로 흐르지 않음
+                            // If LoRA B is all zeros, gradient won't flow to A
                             float max_abs = 0.0f;
                             for (size_t i = 0; i < n_b; i++) {
                                 if (fabsf(b_data[i]) > max_abs) max_abs = fabsf(b_data[i]);
@@ -290,55 +290,25 @@ bool run_moe_backprop_training(
         read_gradient(mctx.grad_b_up, lg.grad_b_up);
         lg.valid = true;
 
-        // 디버그 (첫 레이어만)
-        static bool debug_first = true;
-        if (debug_first && layer_idx == n_layers - 1) {
-            float loss_val = 0.0f;
-            ggml_backend_tensor_get(mctx.loss, &loss_val, 0, sizeof(float));
-
-            auto tensor_stats = [](const char* name, struct ggml_tensor* t) {
-                if (!t) { LOG_INF("  %s: NULL\n", name); return; }
-                std::vector<float> data(ggml_nelements(t));
-                ggml_backend_tensor_get(t, data.data(), 0, ggml_nbytes(t));
-                float sum = 0.0f, mx = 0.0f;
-                int nz = 0;
-                for (auto v : data) { sum += fabsf(v); if (fabsf(v) > mx) mx = fabsf(v); if (v != 0) nz++; }
-                LOG_INF("  %s: mean=%.6e, max=%.6e, nonzero=%d/%zu\n",
-                        name, sum/data.size(), mx, nz, data.size());
-            };
-
-            LOG_INF("\n[DEBUG] Layer %d (first backprop layer):\n", layer_idx);
-            LOG_INF("  alignment_loss=%.6f\n", loss_val);
-            LOG_INF("[DEBUG] Inputs:\n");
-            tensor_stats("inp (hidden)", mctx.inp);
-            tensor_stats("target (ce_grad)", mctx.target);
-            LOG_INF("[DEBUG] Gradients:\n");
-            tensor_stats("grad_gate_w", mctx.grad_gate_w);
-            tensor_stats("grad_a_down", mctx.grad_a_down);
-            tensor_stats("grad_b_down", mctx.grad_b_down);
-            tensor_stats("grad_inp (for next layer)", mctx.grad_inp);
-            debug_first = false;
-        }
-
-        // Gradient chain: grad_inp를 다음 레이어로 전달
+        // Gradient chain: pass grad_inp to next layer
         if (layer_idx > 0 && mctx.grad_inp) {
             ggml_backend_tensor_get(mctx.grad_inp, layer_grad.data(), 0, ggml_nbytes(mctx.grad_inp));
         }
 
-        // 리소스 정리 (weight 업데이트 없이!)
+        // Cleanup resources (no weight update!)
         ggml_backend_buffer_free(mctx.buf);
         ggml_backend_free(mctx.backend);
         ggml_free(mctx.ctx);
     }
 
     // ========================================
-    // PASS 2: 저장된 gradient로 모든 레이어 업데이트
+    // PASS 2: Update all layers with stored gradients
     // ========================================
     for (int layer_idx = 0; layer_idx < n_layers; layer_idx++) {
         layer_gradients & lg = all_grads[layer_idx];
         if (!lg.valid) continue;
 
-        // 다시 mctx 생성하여 weight 로드 → update → sync
+        // Create mctx again: load weight -> update -> sync
         struct moe_lora_train_context mctx = {};
         mctx.n_layers = 1;
         mctx.n_experts = config.n_experts;
@@ -364,7 +334,7 @@ bool run_moe_backprop_training(
             continue;
         }
 
-        // 어댑터에서 현재 weight 로드
+        // Load current weights from adapter
         auto load_lora_from_adapter = [&](const char * pattern,
                                            struct ggml_tensor * lora_a,
                                            struct ggml_tensor * lora_b) -> bool {
@@ -437,7 +407,7 @@ bool run_moe_backprop_training(
             }
         }
 
-        // 저장된 gradient를 gradient 텐서에 쓰기
+        // Write stored gradients to gradient tensors
         write_gradient(mctx.grad_gate_w, lg.grad_gate_w);
         write_gradient(mctx.grad_a_down, lg.grad_a_down);
         write_gradient(mctx.grad_b_down, lg.grad_b_down);
@@ -463,10 +433,10 @@ bool run_moe_backprop_training(
         if (mctx.grad_a_up) adam_update(mctx.lora_a_up, mctx.grad_a_up, adam_a_up, config.lr);
         if (mctx.grad_b_up) adam_update(mctx.lora_b_up, mctx.grad_b_up, adam_b_up, config.lr);
 
-        // 어댑터에 동기화
+        // Sync to adapter
         sync_moe_to_adapter(&mctx, lora, layer_idx, false);
 
-        // 리소스 정리
+        // Cleanup resources
         ggml_backend_buffer_free(mctx.buf);
         ggml_backend_free(mctx.backend);
         ggml_free(mctx.ctx);
