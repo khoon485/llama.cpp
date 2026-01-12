@@ -10,7 +10,6 @@
 
 enum loss_type_v3 {
     LOSS_CE_V3 = 0,
-    LOSS_DPO_V3 = 1,
 };
 
 struct attn_moe_train_config_v3 {
@@ -31,13 +30,7 @@ struct attn_moe_train_config_v3 {
     float rsl_lambda;  // RSL entropy regularizer weight
     float beta;        // Expert preservation weight
 
-    // DPO parameters
     loss_type_v3 loss_type = LOSS_CE_V3;
-    float dpo_beta = 0.1f;  // DPO temperature
-    const all_layer_hidden_states * chosen_states = nullptr;
-    const all_layer_hidden_states * rejected_states = nullptr;
-    float logp_chosen = 0.0f;    // Log probability for chosen response
-    float logp_rejected = 0.0f;  // Log probability for rejected response
 
     std::function<void(int epoch, float loss)> progress_callback;
 };

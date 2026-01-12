@@ -243,42 +243,6 @@ static struct ggml_tensor * build_preserve_loss(
 }
 
 // ============================================================================
-// Build DPO loss
-// ============================================================================
-
-static struct ggml_tensor * build_dpo_loss(
-    struct ggml_context * ctx,
-    struct ggml_tensor * logits_chosen,      // [vocab, n_tokens]
-    struct ggml_tensor * logits_rejected,    // [vocab, n_tokens]
-    struct ggml_tensor * targets_onehot,     // [vocab, n_tokens]
-    float beta
-) {
-    // 1. Log softmax
-    struct ggml_tensor * log_probs_c = ggml_soft_max(ctx, logits_chosen);
-    log_probs_c = ggml_log(ctx, log_probs_c);
-
-    struct ggml_tensor * log_probs_r = ggml_soft_max(ctx, logits_rejected);
-    log_probs_r = ggml_log(ctx, log_probs_r);
-
-    // 2. Sum over tokens: logp = sum(log_probs * targets)
-    struct ggml_tensor * chosen_logp = ggml_sum(ctx, ggml_mul(ctx, log_probs_c, targets_onehot));
-    struct ggml_tensor * rejected_logp = ggml_sum(ctx, ggml_mul(ctx, log_probs_r, targets_onehot));
-
-    // 3. Difference: logp_c - logp_r
-    struct ggml_tensor * diff = ggml_sub(ctx, chosen_logp, rejected_logp);
-
-    // 4. Scaled: beta * diff
-    struct ggml_tensor * scaled = ggml_scale(ctx, diff, beta);
-
-    // 5. DPO loss = -log(sigmoid(x)) = softplus(-x)
-    struct ggml_tensor * neg_scaled = ggml_neg(ctx, scaled);
-    struct ggml_tensor * dpo_loss = ggml_softplus(ctx, neg_scaled);
-
-    ggml_set_name(dpo_loss, "dpo_loss");
-    return dpo_loss;
-}
-
-// ============================================================================
 // Main training function v3 (end-to-end)
 // ============================================================================
 
@@ -356,8 +320,6 @@ bool run_attn_moe_training_v3(
 
         // Create tensors for all layers
         std::vector<struct ggml_tensor *> layer_frozen(n_layers);
-        std::vector<struct ggml_tensor *> chosen_frozen(n_layers);   // DPO only
-        std::vector<struct ggml_tensor *> rejected_frozen(n_layers); // DPO only
         std::vector<struct ggml_tensor *> router_w(n_layers);
         std::vector<struct ggml_tensor *> o_router_w(n_layers);
         std::vector<struct ggml_tensor *> q_lora_a(n_layers);
@@ -445,167 +407,78 @@ bool run_attn_moe_training_v3(
         struct ggml_tensor * targets_onehot = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, config.n_vocab, n_tokens);
 
         // ========================================================================
-        // Loss computation: CE or DPO
+        // Loss computation: CE only
         // ========================================================================
         struct ggml_tensor * task_loss = nullptr;
         struct ggml_tensor * rsl_loss = nullptr;
         struct ggml_tensor * preserve_loss = nullptr;
 
-        // Declare outputs for both modes (only one will be used)
-        std::vector<layer_lora_output> ce_layer_outputs;  // CE mode
-        end_to_end_output chosen_out;   // DPO mode
-        end_to_end_output rejected_out; // DPO mode
+        // Forward pass: chain all layers
+        std::vector<layer_lora_output> layer_outputs(n_layers);
+        struct ggml_tensor * current_input = layer_frozen[0];
 
-        if (config.loss_type == LOSS_CE_V3) {
-            // ====================================================================
-            // CE Mode: Standard cross-entropy loss
-            // ====================================================================
-
-            // Forward pass: chain all layers
-            struct ggml_tensor * current_input = layer_frozen[0];
-            ce_layer_outputs.resize(n_layers);
-
-            for (int i = 0; i < n_layers; i++) {
-                ce_layer_outputs[i] = build_layer_lora_forward(
-                    ctx,
-                    layer_frozen[i],
-                    current_input,
-                    router_w[i],
-                    o_router_w[i],
-                    q_lora_a[i],
-                    q_lora_b[i],
-                    k_lora_a[i],
-                    k_lora_b[i],
-                    v_lora_a[i],
-                    v_lora_b[i],
-                    o_lora_a[i],
-                    o_lora_b[i],
-                    lora_scale,
-                    i
-                );
-                current_input = ce_layer_outputs[i].output;
-            }
-
-            // Final output
-            struct ggml_tensor * final_output = ce_layer_outputs[n_layers - 1].output;
-
-            // Normalize
-            struct ggml_tensor * normalized = ggml_rms_norm(ctx, final_output, 1e-5f);
-            normalized = ggml_mul(ctx, normalized, t_output_norm);
-            ggml_set_name(normalized, "normalized");
-
-            // Project to vocab
-            struct ggml_tensor * logits = ggml_mul_mat(ctx, t_lm_head, normalized);
-            ggml_set_name(logits, "logits");
-
-            // Task loss: cross-entropy
-            task_loss = ggml_cross_entropy_loss(ctx, logits, targets_onehot);
-            ggml_set_name(task_loss, "task_loss");
-
-            // L_RSL: accumulate from all layers
-            for (int i = 0; i < n_layers; i++) {
-                struct ggml_tensor * layer_rsl = build_rsl_loss(ctx, ce_layer_outputs[i].router_probs, config.rsl_alpha, config.rsl_lambda);
-                struct ggml_tensor * o_layer_rsl = build_rsl_loss(ctx, ce_layer_outputs[i].o_router_probs, config.rsl_alpha, config.rsl_lambda);
-                struct ggml_tensor * combined_rsl = ggml_add(ctx, layer_rsl, o_layer_rsl);
-                rsl_loss = rsl_loss ? ggml_add(ctx, rsl_loss, combined_rsl) : combined_rsl;
-            }
-            ggml_set_name(rsl_loss, "rsl_loss");
-
-            // L_preserve: accumulate from all layers
-            for (int i = 0; i < n_layers; i++) {
-                struct ggml_tensor * layer_preserve = build_preserve_loss(
-                    ctx,
-                    q_lora_a[i], q_lora_b[i], k_lora_a[i], k_lora_b[i],
-                    v_lora_a[i], v_lora_b[i], o_lora_a[i], o_lora_b[i],
-                    q_a_init[i], q_b_init[i], k_a_init[i], k_b_init[i],
-                    v_a_init[i], v_b_init[i], o_a_init[i], o_b_init[i]
-                );
-                preserve_loss = preserve_loss ? ggml_add(ctx, preserve_loss, layer_preserve) : layer_preserve;
-            }
-            preserve_loss = ggml_scale(ctx, preserve_loss, config.beta);
-            ggml_set_name(preserve_loss, "preserve_loss");
-
-        } else if (config.loss_type == LOSS_DPO_V3) {
-            // ====================================================================
-            // DPO Mode: Two forward passes (chosen + rejected)
-            // ====================================================================
-
-            if (!config.chosen_states || !config.rejected_states) {
-                LOG_ERR("[v3] DPO mode requires chosen_states and rejected_states\n");
-                ggml_free(ctx);
-                return false;
-            }
-
-            LOG_INF("[v3] DPO mode: running chosen + rejected forwards\n");
-
-            // Create frozen tensors for chosen and rejected states
-            for (int i = 0; i < n_layers; i++) {
-                chosen_frozen[i] = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, config.n_embd, n_tokens);
-                rejected_frozen[i] = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, config.n_embd, n_tokens);
-            }
-
-            // Forward pass: chosen
-            end_to_end_output chosen_out = build_end_to_end_forward(
-                ctx, *config.chosen_states,
-                router_w, o_router_w,
-                q_lora_a, q_lora_b, k_lora_a, k_lora_b,
-                v_lora_a, v_lora_b, o_lora_a, o_lora_b,
-                chosen_frozen, t_lm_head, t_output_norm,
-                lora_scale, n_layers
+        for (int i = 0; i < n_layers; i++) {
+            layer_outputs[i] = build_layer_lora_forward(
+                ctx,
+                layer_frozen[i],
+                current_input,
+                router_w[i],
+                o_router_w[i],
+                q_lora_a[i],
+                q_lora_b[i],
+                k_lora_a[i],
+                k_lora_b[i],
+                v_lora_a[i],
+                v_lora_b[i],
+                o_lora_a[i],
+                o_lora_b[i],
+                lora_scale,
+                i
             );
-            ggml_set_name(chosen_out.logits, "logits_chosen");
-
-            // Forward pass: rejected
-            end_to_end_output rejected_out = build_end_to_end_forward(
-                ctx, *config.rejected_states,
-                router_w, o_router_w,
-                q_lora_a, q_lora_b, k_lora_a, k_lora_b,
-                v_lora_a, v_lora_b, o_lora_a, o_lora_b,
-                rejected_frozen, t_lm_head, t_output_norm,
-                lora_scale, n_layers
-            );
-            ggml_set_name(rejected_out.logits, "logits_rejected");
-
-            // Task loss: DPO loss
-            task_loss = build_dpo_loss(ctx, chosen_out.logits, rejected_out.logits, targets_onehot, config.dpo_beta);
-            ggml_set_name(task_loss, "dpo_loss");
-
-            // L_RSL: accumulate from both chosen and rejected
-            for (int i = 0; i < n_layers; i++) {
-                // Chosen RSL
-                struct ggml_tensor * c_rsl = build_rsl_loss(ctx, chosen_out.layer_outputs[i].router_probs, config.rsl_alpha, config.rsl_lambda);
-                struct ggml_tensor * c_o_rsl = build_rsl_loss(ctx, chosen_out.layer_outputs[i].o_router_probs, config.rsl_alpha, config.rsl_lambda);
-
-                // Rejected RSL
-                struct ggml_tensor * r_rsl = build_rsl_loss(ctx, rejected_out.layer_outputs[i].router_probs, config.rsl_alpha, config.rsl_lambda);
-                struct ggml_tensor * r_o_rsl = build_rsl_loss(ctx, rejected_out.layer_outputs[i].o_router_probs, config.rsl_alpha, config.rsl_lambda);
-
-                // Combine: (chosen_q_rsl + chosen_o_rsl) + (rejected_q_rsl + rejected_o_rsl)
-                struct ggml_tensor * chosen_combined = ggml_add(ctx, c_rsl, c_o_rsl);
-                struct ggml_tensor * rejected_combined = ggml_add(ctx, r_rsl, r_o_rsl);
-                struct ggml_tensor * layer_combined = ggml_add(ctx, chosen_combined, rejected_combined);
-
-                rsl_loss = rsl_loss ? ggml_add(ctx, rsl_loss, layer_combined) : layer_combined;
-            }
-            ggml_set_name(rsl_loss, "rsl_loss");
-
-            // L_preserve: accumulate from all layers (same as CE)
-            for (int i = 0; i < n_layers; i++) {
-                struct ggml_tensor * layer_preserve = build_preserve_loss(
-                    ctx,
-                    q_lora_a[i], q_lora_b[i], k_lora_a[i], k_lora_b[i],
-                    v_lora_a[i], v_lora_b[i], o_lora_a[i], o_lora_b[i],
-                    q_a_init[i], q_b_init[i], k_a_init[i], k_b_init[i],
-                    v_a_init[i], v_b_init[i], o_a_init[i], o_b_init[i]
-                );
-                preserve_loss = preserve_loss ? ggml_add(ctx, preserve_loss, layer_preserve) : layer_preserve;
-            }
-            preserve_loss = ggml_scale(ctx, preserve_loss, config.beta);
-            ggml_set_name(preserve_loss, "preserve_loss");
+            current_input = layer_outputs[i].output;
         }
 
+        // Final output
+        struct ggml_tensor * final_output = layer_outputs[n_layers - 1].output;
+
+        // Normalize
+        struct ggml_tensor * normalized = ggml_rms_norm(ctx, final_output, 1e-5f);
+        normalized = ggml_mul(ctx, normalized, t_output_norm);
+        ggml_set_name(normalized, "normalized");
+
+        // Project to vocab
+        struct ggml_tensor * logits = ggml_mul_mat(ctx, t_lm_head, normalized);
+        ggml_set_name(logits, "logits");
+
+        // Task loss: cross-entropy
+        task_loss = ggml_cross_entropy_loss(ctx, logits, targets_onehot);
+        ggml_set_name(task_loss, "task_loss");
+
+        // L_RSL: accumulate from all layers
+        for (int i = 0; i < n_layers; i++) {
+            struct ggml_tensor * layer_rsl = build_rsl_loss(ctx, layer_outputs[i].router_probs, config.rsl_alpha, config.rsl_lambda);
+            struct ggml_tensor * o_layer_rsl = build_rsl_loss(ctx, layer_outputs[i].o_router_probs, config.rsl_alpha, config.rsl_lambda);
+            struct ggml_tensor * combined_rsl = ggml_add(ctx, layer_rsl, o_layer_rsl);
+            rsl_loss = rsl_loss ? ggml_add(ctx, rsl_loss, combined_rsl) : combined_rsl;
+        }
+        ggml_set_name(rsl_loss, "rsl_loss");
+
+        // L_preserve: accumulate from all layers
+        for (int i = 0; i < n_layers; i++) {
+            struct ggml_tensor * layer_preserve = build_preserve_loss(
+                ctx,
+                q_lora_a[i], q_lora_b[i], k_lora_a[i], k_lora_b[i],
+                v_lora_a[i], v_lora_b[i], o_lora_a[i], o_lora_b[i],
+                q_a_init[i], q_b_init[i], k_a_init[i], k_b_init[i],
+                v_a_init[i], v_b_init[i], o_a_init[i], o_b_init[i]
+            );
+            preserve_loss = preserve_loss ? ggml_add(ctx, preserve_loss, layer_preserve) : layer_preserve;
+        }
+        preserve_loss = ggml_scale(ctx, preserve_loss, config.beta);
+        ggml_set_name(preserve_loss, "preserve_loss");
+
         // ========================================================================
-        // Total loss (common for both CE and DPO)
+        // Total loss
         // ========================================================================
         struct ggml_tensor * loss = ggml_add(ctx, task_loss, ggml_add(ctx, rsl_loss, preserve_loss));
         ggml_set_name(loss, "total_loss");
@@ -642,22 +515,11 @@ bool run_attn_moe_training_v3(
                     break;
                 }
                 // Router_probs: also nullptr for auto-accumulation
-                if (config.loss_type == LOSS_CE_V3) {
-                    if (node == ce_layer_outputs[l].router_probs ||
-                        node == ce_layer_outputs[l].o_router_probs) {
-                        grad_accs[i] = nullptr;
-                        is_view_source = true;
-                        break;
-                    }
-                } else if (config.loss_type == LOSS_DPO_V3) {
-                    if (node == chosen_out.layer_outputs[l].router_probs ||
-                        node == chosen_out.layer_outputs[l].o_router_probs ||
-                        node == rejected_out.layer_outputs[l].router_probs ||
-                        node == rejected_out.layer_outputs[l].o_router_probs) {
-                        grad_accs[i] = nullptr;
-                        is_view_source = true;
-                        break;
-                    }
+                if (node == layer_outputs[l].router_probs ||
+                    node == layer_outputs[l].o_router_probs) {
+                    grad_accs[i] = nullptr;
+                    is_view_source = true;
+                    break;
                 }
             }
 
@@ -745,46 +607,16 @@ bool run_attn_moe_training_v3(
         }
 
         // Load frozen hidden states
-        if (config.loss_type == LOSS_CE_V3) {
-            // CE mode: load single set of frozen states
-            for (int i = 0; i < n_layers; i++) {
-                const float * layer_data = hidden_states.layer_input[i].data();
-                if (!layer_data || hidden_states.n_tokens != n_tokens) {
-                    LOG_ERR("[v3] Layer %d: invalid hidden state\n", i);
-                    ggml_backend_buffer_free(buf);
-                    ggml_backend_free(backend);
-                    ggml_free(ctx);
-                    return false;
-                }
-                write_tensor(layer_frozen[i], std::vector<float>(layer_data, layer_data + n_embd * n_tokens));
+        for (int i = 0; i < n_layers; i++) {
+            const float * layer_data = hidden_states.layer_input[i].data();
+            if (!layer_data || hidden_states.n_tokens != n_tokens) {
+                LOG_ERR("[v3] Layer %d: invalid hidden state\n", i);
+                ggml_backend_buffer_free(buf);
+                ggml_backend_free(backend);
+                ggml_free(ctx);
+                return false;
             }
-        } else if (config.loss_type == LOSS_DPO_V3) {
-            // DPO mode: load chosen and rejected frozen states
-            for (int i = 0; i < n_layers; i++) {
-                // Load chosen states
-                const float * chosen_data = config.chosen_states->layer_input[i].data();
-                if (!chosen_data || config.chosen_states->n_tokens != n_tokens) {
-                    LOG_ERR("[v3] DPO Layer %d: invalid chosen state\n", i);
-                    ggml_backend_buffer_free(buf);
-                    ggml_backend_free(backend);
-                    ggml_free(ctx);
-                    return false;
-                }
-
-                // Load rejected states
-                const float * rejected_data = config.rejected_states->layer_input[i].data();
-                if (!rejected_data || config.rejected_states->n_tokens != n_tokens) {
-                    LOG_ERR("[v3] DPO Layer %d: invalid rejected state\n", i);
-                    ggml_backend_buffer_free(buf);
-                    ggml_backend_free(backend);
-                    ggml_free(ctx);
-                    return false;
-                }
-
-                // Write chosen and rejected data to tensors
-                write_tensor(chosen_frozen[i], std::vector<float>(chosen_data, chosen_data + n_embd * n_tokens));
-                write_tensor(rejected_frozen[i], std::vector<float>(rejected_data, rejected_data + n_embd * n_tokens));
-            }
+            write_tensor(layer_frozen[i], std::vector<float>(layer_data, layer_data + n_embd * n_tokens));
         }
 
         // Load LoRA weights

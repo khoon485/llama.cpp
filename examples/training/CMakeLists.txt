@@ -27,6 +27,22 @@ target_link_libraries(${TARGET} PRIVATE common llama ${CMAKE_THREAD_LIBS_INIT})
 target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_features(${TARGET} PRIVATE cxx_std_17)
 
+set(TARGET llama-lora-moe-dpo)
+add_executable(${TARGET}
+    lora-moe-dpo.cpp
+    optimizer.cpp
+    lora_utils.cpp
+    bridge.cpp
+    attn_moe/attn_moe_graph.cpp
+    attn_moe/attn_moe_storage.cpp
+    attn_moe/attn_moe_sync.cpp
+    attn_moe/attn_moe_trainer_v3.cpp
+)
+install(TARGETS ${TARGET} RUNTIME)
+target_link_libraries(${TARGET} PRIVATE common llama ${CMAKE_THREAD_LIBS_INIT})
+target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_features(${TARGET} PRIVATE cxx_std_17)
+
 set(TARGET test-ce-loss)
 add_executable(${TARGET} test_ce_loss.cpp)
 target_link_libraries(${TARGET} PRIVATE ggml ggml-cpu ggml-cuda)

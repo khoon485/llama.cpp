@@ -21,6 +21,7 @@
 enum class TrainMode {
     MOE_FFN,      // MoE FFN with LoRA
     ATTN_MOE,     // Attention projection with LoRA-MoE
+    DPO,          // Direct Preference Optimization
 };
 
 static TrainMode g_train_mode = TrainMode::MOE_FFN;
@@ -44,6 +45,13 @@ static std::string get_time_str() {
     snprintf(buf, sizeof(buf), "%02d:%02d:%02d", t->tm_hour, t->tm_min, t->tm_sec);
     return std::string(buf);
 }
+
+// DPO 데이터 구조체
+struct dpo_pair {
+    std::string prompt;
+    std::string chosen;
+    std::string rejected;
+};
 
 #if defined(_MSC_VER)
 #pragma warning(disable: 4244 4267)
@@ -110,6 +118,45 @@ int main(int argc, char ** argv) {
                 n_layer, n_experts);
     }
 
+    // Check DPO mode (uses ATTN_MOE internally)
+    static std::vector<dpo_pair> g_dpo_data;
+    static std::string g_dpo_file;
+    const char * dpo_env = std::getenv("DPO");
+    if (dpo_env && std::string(dpo_env) == "1") {
+        g_train_mode = TrainMode::DPO;
+        params.moe_lora_training = true;
+
+        // DPO 데이터 파일 (DPO_FILE 환경변수 또는 기본값)
+        const char * dpo_file_env = std::getenv("DPO_FILE");
+        g_dpo_file = dpo_file_env ? dpo_file_env : "/tmp/dpo_test_10.jsonl";
+
+        // DPO 데이터 로드
+        std::ifstream ifs(g_dpo_file);
+        if (!ifs.is_open()) {
+            LOG_ERR("DPO: failed to open %s\n", g_dpo_file.c_str());
+            return 1;
+        }
+        std::string line;
+        while (std::getline(ifs, line)) {
+            if (line.empty()) continue;
+            auto j = json::parse(line);
+            dpo_pair p;
+            p.prompt = j.value("prompt", "");
+            p.chosen = j.value("chosen", "");
+            p.rejected = j.value("rejected", "");
+            g_dpo_data.push_back(p);
+        }
+        LOG_INF("DPO: loaded %zu pairs from %s\n", g_dpo_data.size(), g_dpo_file.c_str());
+
+        // Pre-scan for buffer sizing (same as ATTN_MOE)
+        int n_layer = read_model_n_layer(params.model.path.c_str());
+        if (n_layer == 0) n_layer = 24;
+        int n_experts = read_adapter_moe_n_experts(params.lora_adapters[0].path.c_str());
+        if (n_experts == 0) n_experts = 32;
+        params.moe_lora_n_layers = n_layer;
+        params.moe_lora_n_experts = n_experts;
+    }
+
     // ========================================
     // Phase 2: Initialize model and context with correct buffer sizes
     // ========================================
@@ -170,6 +217,10 @@ int main(int argc, char ** argv) {
     const char * epochs_env = std::getenv("EPOCHS");
     if (epochs_env) total_epochs = std::atoi(epochs_env);
 
+    float dpo_beta = 0.1f;
+    const char * beta_env = std::getenv("DPO_BETA");
+    if (beta_env) dpo_beta = std::stof(beta_env);
+
     float initial_loss = compute_loss(ctx, tokens, params.n_batch);
     LOG_INF("Initial CE loss: %.4f\n", initial_loss);
 
@@ -188,10 +239,12 @@ int main(int argc, char ** argv) {
     };
 
     // ========================================
-    // 4A. LoRA-Mixer 학습 (ATTN_MOE)
+    // 4A. LoRA-Mixer 학습 (ATTN_MOE, DPO, 향후 GRPO 등)
     // ========================================
     if (g_train_mode != TrainMode::MOE_FFN) {
-        LOG_INF("\n=== ATTN_MOE Training (LoRA-Mixer) ===\n");
+        const char * mode_name = (g_train_mode == TrainMode::DPO) ? "DPO" :
+                                 (g_train_mode == TrainMode::ATTN_MOE) ? "ATTN_MOE" : "UNKNOWN";
+        LOG_INF("\n=== %s Training (LoRA-Mixer) ===\n", mode_name);
 
         // 공통 모델 파라미터
         const auto * lmodel = reinterpret_cast<const llama_model *>(model);
@@ -215,20 +268,34 @@ int main(int argc, char ** argv) {
         attn_config.lora_alpha = 32.0f;
         attn_config.rsl_alpha = 1.0f;
         attn_config.rsl_lambda = 0.1f;
-        attn_config.loss_type = LOSS_CE;
+        attn_config.loss_type = (g_train_mode == TrainMode::DPO) ? LOSS_DPO : LOSS_CE;
+        attn_config.dpo_beta = dpo_beta;
 
-        LOG_INF("Config: epochs=%d, n_experts=%d, rank=%d\n",
-                total_epochs, attn_config.n_experts, attn_config.rank);
+        LOG_INF("Config: mode=%s, epochs=%d, n_experts=%d, rank=%d\n",
+                mode_name, total_epochs, attn_config.n_experts, attn_config.rank);
+
+        // DPO용 hidden states
+        all_layer_hidden_states chosen_states, rejected_states;
+        if (g_train_mode == TrainMode::DPO) {
+            chosen_states.n_layers = n_layers;
+            chosen_states.layer_input.resize(n_layers);
+            rejected_states.n_layers = n_layers;
+            rejected_states.layer_input.resize(n_layers);
+        }
 
         // CE 모드: epoch loop 밖에서 한 번만 hidden states 캡처
-        std::vector<float> grads;
-        LOG_INF("Capturing hidden states once (CE mode, same data for all epochs)...\n");
-        capture_and_compute_grad(input_tokens, target_tokens, g_hidden_states, grads);
-        LOG_INF("Hidden states: %d layers captured (n_embd=%d, n_tokens=%d)\n",
-                g_hidden_states.n_layers, g_hidden_states.n_embd, g_hidden_states.n_tokens);
+        // (DPO는 매 epoch 다른 데이터를 사용하므로 epoch loop 안에서 캡처)
+        std::vector<float> grads_chosen, grads_rejected;
+        all_layer_hidden_states * states_ptr = &g_hidden_states;
+        if (g_train_mode != TrainMode::DPO) {
+            LOG_INF("Capturing hidden states once (CE mode, same data for all epochs)...\n");
+            capture_and_compute_grad(input_tokens, target_tokens, g_hidden_states, grads_chosen);
+            LOG_INF("Hidden states: %d layers captured (n_embd=%d, n_tokens=%d)\n",
+                    g_hidden_states.n_layers, g_hidden_states.n_embd, g_hidden_states.n_tokens);
+        }
 
         // v2/v3: trainer handles epoch loop internally, call once
-        // v1: trainer handles 1 epoch, call multiple times
+        // v1: trainer handles 1 epoch, call multiple times (for DPO mode compatibility)
         bool use_v3 = (getenv("ATTN_MOE_V3") != nullptr);
         bool use_v2 = (getenv("ATTN_MOE_V2") != nullptr);
         int outer_epochs = (use_v2 || use_v3) ? 1 : total_epochs;
@@ -236,6 +303,93 @@ int main(int argc, char ** argv) {
         for (int epoch = 0; epoch < outer_epochs; epoch++) {
             fprintf(stderr, "\rEpoch %2d/%d: training... ", epoch + 1, total_epochs);
             fflush(stderr);
+
+            if (g_train_mode == TrainMode::DPO) {
+                // DPO: chosen/rejected 각각 처리
+                if (g_dpo_data.empty()) { LOG_ERR("DPO: no data\n"); return 1; }
+                const auto & pair = g_dpo_data[epoch % g_dpo_data.size()];
+
+                const llama_vocab * vocab = llama_model_get_vocab(model);
+                std::string chosen_text = pair.prompt + pair.chosen;
+                std::string rejected_text = pair.prompt + pair.rejected;
+
+                int ctx_size = llama_n_ctx(ctx);
+                std::vector<llama_token> chosen_tokens(ctx_size), rejected_tokens(ctx_size);
+                int n_ch = llama_tokenize(vocab, chosen_text.c_str(), chosen_text.size(),
+                                          chosen_tokens.data(), ctx_size, true, false);
+                int n_rj = llama_tokenize(vocab, rejected_text.c_str(), rejected_text.size(),
+                                          rejected_tokens.data(), ctx_size, true, false);
+
+                // 토큰 수 검증 (최소 2개 필요: input + target)
+                if (n_ch < 2 || n_rj < 2) {
+                    LOG_WRN("DPO: pair %d skipped (n_ch=%d, n_rj=%d, ctx=%d)\n",
+                            epoch % (int)g_dpo_data.size(), n_ch, n_rj, ctx_size);
+                    continue;
+                }
+                // 컨텍스트 초과시 truncate
+                n_ch = std::min(n_ch, ctx_size);
+                n_rj = std::min(n_rj, ctx_size);
+                chosen_tokens.resize(n_ch);
+                rejected_tokens.resize(n_rj);
+
+                // logp 계산 (각 단계 전후로 KV cache 완전 클리어)
+                LOG_INF("[DPO-DBG] Step 1: logp chosen 계산 시작\n");
+                llama_memory_clear(llama_get_memory(ctx), true);
+                attn_config.logp_chosen = -compute_loss(ctx, chosen_tokens, params.n_batch) * n_ch;
+                llama_memory_clear(llama_get_memory(ctx), true);  // compute_loss 후 클리어
+
+                LOG_INF("[DPO-DBG] Step 2: logp rejected 계산 시작\n");
+                attn_config.logp_rejected = -compute_loss(ctx, rejected_tokens, params.n_batch) * n_rj;
+                llama_memory_clear(llama_get_memory(ctx), true);  // compute_loss 후 클리어
+                LOG_INF("[DPO-DBG] logp_c=%.4f, logp_r=%.4f, isfinite: %d/%d\n",
+                        attn_config.logp_chosen, attn_config.logp_rejected,
+                        std::isfinite(attn_config.logp_chosen), std::isfinite(attn_config.logp_rejected));
+
+                // 캡처는 g_hidden_states로 해야함 (callback이 g_hidden_states만 봄)
+                // 캡처 후 chosen_states/rejected_states로 복사
+                LOG_INF("[DPO-DBG] Step 3: chosen hidden states 캡처\n");
+                std::vector<llama_token> ch_in(chosen_tokens.begin(), chosen_tokens.end() - 1);
+                std::vector<llama_token> ch_tgt(chosen_tokens.begin() + 1, chosen_tokens.end());
+                capture_and_compute_grad(ch_in, ch_tgt, g_hidden_states, grads_chosen);
+                // g_hidden_states → chosen_states 복사
+                chosen_states.n_embd = g_hidden_states.n_embd;
+                chosen_states.n_tokens = g_hidden_states.n_tokens;
+                for (int i = 0; i < n_layers; i++) {
+                    chosen_states.layer_input[i] = g_hidden_states.layer_input[i];
+                }
+                // DEBUG: chosen_states NaN 체크
+                int nan_layers_ch = 0;
+                for (int i = 0; i < n_layers; i++) {
+                    for (float v : chosen_states.layer_input[i]) {
+                        if (!std::isfinite(v)) { nan_layers_ch++; break; }
+                    }
+                }
+                LOG_INF("[DPO-DBG] chosen_states: %d/%d layers have NaN\n", nan_layers_ch, n_layers);
+
+                LOG_INF("[DPO-DBG] Step 4: rejected hidden states 캡처\n");
+                std::vector<llama_token> rj_in(rejected_tokens.begin(), rejected_tokens.end() - 1);
+                std::vector<llama_token> rj_tgt(rejected_tokens.begin() + 1, rejected_tokens.end());
+                capture_and_compute_grad(rj_in, rj_tgt, g_hidden_states, grads_rejected);
+                // g_hidden_states → rejected_states 복사
+                rejected_states.n_embd = g_hidden_states.n_embd;
+                rejected_states.n_tokens = g_hidden_states.n_tokens;
+                for (int i = 0; i < n_layers; i++) {
+                    rejected_states.layer_input[i] = g_hidden_states.layer_input[i];
+                }
+                // DEBUG: grads NaN 체크
+                int nan_grad_ch = 0, nan_grad_rj = 0;
+                for (float v : grads_chosen) { if (!std::isfinite(v)) { nan_grad_ch++; } }
+                for (float v : grads_rejected) { if (!std::isfinite(v)) { nan_grad_rj++; } }
+                LOG_INF("[DPO-DBG] grads NaN: chosen=%d, rejected=%d\n", nan_grad_ch, nan_grad_rj);
+
+                attn_config.chosen_states = &chosen_states;
+                attn_config.rejected_states = &rejected_states;
+                attn_config.chosen_grad = &grads_chosen;
+                attn_config.rejected_grad = &grads_rejected;
+                attn_config.n_tokens = ch_in.size();
+                states_ptr = &chosen_states;
+            }
+            // CE mode: hidden states already captured outside epoch loop
 
             // Progress callback
             attn_config.progress_callback = [&](int /*ep*/, int layer_idx, float loss) {
@@ -272,7 +426,18 @@ int main(int argc, char ** argv) {
                 config_v3.rsl_alpha = attn_config.rsl_alpha;
                 config_v3.rsl_lambda = attn_config.rsl_lambda;
                 config_v3.beta = 0.01f;  // preservation loss weight
-                config_v3.loss_type = LOSS_CE_V3;
+
+                // DPO mode configuration
+                if (g_train_mode == TrainMode::DPO) {
+                    config_v3.loss_type = LOSS_DPO_V3;
+                    config_v3.dpo_beta = dpo_beta;
+                    config_v3.chosen_states = &chosen_states;
+                    config_v3.rejected_states = &rejected_states;
+                    LOG_INF("[v3-DPO] dpo_beta=%.4f, logp_c=%.4f, logp_r=%.4f\n",
+                            dpo_beta, attn_config.logp_chosen, attn_config.logp_rejected);
+                } else {
+                    config_v3.loss_type = LOSS_CE_V3;
+                }
 
                 // progress callback
                 config_v3.progress_callback = [&](int ep, float loss) {
@@ -283,7 +448,7 @@ int main(int argc, char ** argv) {
                 };
 
                 attn_moe_train_result_v3 result_v3 = {};
-                if (!run_attn_moe_training_v3(lora, model, g_hidden_states, target_tokens, config_v3, &result_v3)) {
+                if (!run_attn_moe_training_v3(lora, model, *states_ptr, target_tokens, config_v3, &result_v3)) {
                     LOG_ERR("%s: training v3 failed at epoch %d\n", __func__, epoch);
                     return 1;
                 }
@@ -322,7 +487,7 @@ int main(int argc, char ** argv) {
                 };
 
                 attn_moe_train_result_v2 result_v2 = {};
-                if (!run_attn_moe_training_v2(lora, model, g_hidden_states, target_tokens, config_v2, &result_v2)) {
+                if (!run_attn_moe_training_v2(lora, model, *states_ptr, target_tokens, config_v2, &result_v2)) {
                     LOG_ERR("%s: training v2 failed at epoch %d\n", __func__, epoch);
                     return 1;
                 }
@@ -331,11 +496,13 @@ int main(int argc, char ** argv) {
                         result_v2.final_loss, result_v2.avg_task_loss, result_v2.avg_rsl_loss, result_v2.avg_preserve_loss);
             } else {
                 LOG_INF("[v1] Using trainer v1 (gradient matching)\n");
+                LOG_INF("[DPO-DBG] Step 5: run_attn_moe_training 시작\n");
                 attn_moe_train_result result = {};
-                if (!run_attn_moe_training(lora, g_hidden_states, grads, attn_config, &result)) {
+                if (!run_attn_moe_training(lora, *states_ptr, grads_chosen, attn_config, &result)) {
                     LOG_ERR("%s: training failed at epoch %d\n", __func__, epoch);
                     return 1;
                 }
+                LOG_INF("[DPO-DBG] Step 6: 학습 완료, sync 시작\n");
             }
 
             // 가중치 동기화
