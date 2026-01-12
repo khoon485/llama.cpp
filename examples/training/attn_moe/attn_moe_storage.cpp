@@ -24,7 +24,7 @@ void init_kaiming(std::vector<float> & data, int fan_in) {
 
 void init_small(std::vector<float> & data) {
     std::mt19937 gen(42);
-    std::normal_distribution<float> dist(0.0f, 0.01f);
+    std::normal_distribution<float> dist(0.0f, 0.001f);  // TRL uses smaller init
     for (size_t i = 0; i < data.size(); i++) {
         data[i] = dist(gen);
     }
@@ -61,7 +61,8 @@ void init_lora_mixer_storage(const attn_moe_train_config & cfg) {
     g_weights.kv_out_dim = kv_out_dim;
     g_weights.layers.resize(cfg.n_layers);
 
-    size_t router_size = cfg.n_embd * cfg.n_experts;
+    size_t router_size = cfg.n_embd * cfg.n_experts;      // Q,K,V용
+    size_t o_router_size = q_out_dim * cfg.n_experts;     // O용 (다른 입력 차원!)
     size_t lora_a_size = cfg.n_embd * cfg.rank * cfg.n_experts;
     size_t q_lora_b_size = cfg.rank * q_out_dim * cfg.n_experts;
     size_t kv_lora_b_size = cfg.rank * kv_out_dim * cfg.n_experts;
@@ -72,6 +73,7 @@ void init_lora_mixer_storage(const attn_moe_train_config & cfg) {
         auto & lw = g_weights.layers[l];
 
         lw.router_w.resize(router_size);
+        lw.o_router_w.resize(o_router_size);  // O projection용 별도 router
         lw.q_lora_a.resize(lora_a_size);
         lw.q_lora_b.resize(q_lora_b_size);
         lw.k_lora_a.resize(lora_a_size);
@@ -82,6 +84,7 @@ void init_lora_mixer_storage(const attn_moe_train_config & cfg) {
         lw.o_lora_b.resize(o_lora_b_size);
 
         init_router(lw.router_w);
+        init_router(lw.o_router_w);  // O projection router도 초기화
         init_kaiming(lw.q_lora_a, cfg.n_embd);
         init_small(lw.q_lora_b);
         init_kaiming(lw.k_lora_a, cfg.n_embd);
@@ -104,6 +107,7 @@ void init_lora_mixer_storage(const attn_moe_train_config & cfg) {
     }
 
     g_adam.router.resize(cfg.n_layers);
+    g_adam.o_router.resize(cfg.n_layers);  // O projection router adam state
     g_adam.q_a.resize(cfg.n_layers);
     g_adam.q_b.resize(cfg.n_layers);
     g_adam.k_a.resize(cfg.n_layers);

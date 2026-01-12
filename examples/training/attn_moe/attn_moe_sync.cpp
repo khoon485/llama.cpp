@@ -5,7 +5,9 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 
+#include <cmath>
 #include <cstring>
+#include <string>
 
 // Static state for moe tensors
 static ggml_context * s_moe_ctx = nullptr;
@@ -44,6 +46,19 @@ static void create_projection_tensors(
     }
 }
 
+// NaN 체크 헬퍼 (sync용)
+static bool sync_has_nan(const std::vector<float> & v, const char * name) {
+    int nan_count = 0;
+    for (size_t i = 0; i < v.size(); i++) {
+        if (!std::isfinite(v[i])) nan_count++;
+    }
+    if (nan_count > 0) {
+        LOG_ERR("[SYNC] %s: %d NaN/Inf (size=%zu)\n", name, nan_count, v.size());
+        return true;
+    }
+    return false;
+}
+
 // Helper to copy data to tensors using backend API
 static void sync_projection_data(
     struct llama_adapter_lora * adapter,
@@ -58,10 +73,23 @@ static void sync_projection_data(
         return;
     }
 
+    // DEBUG: sync 전 소스 데이터 체크
+    sync_has_nan(lora_a, (std::string(name) + ".lora_a").c_str());
+    sync_has_nan(lora_b, (std::string(name) + ".lora_b").c_str());
+    sync_has_nan(router, (std::string(name) + ".router").c_str());
+
     llama_adapter_lora_moe_weight * mw = &it->second;
 
     size_t expert_a_size = in_dim * rank;
     size_t expert_b_size = rank * out_dim;
+
+    // Debug: check sizes
+    size_t expected_a = n_experts * expert_a_size;
+    size_t expected_b = n_experts * expert_b_size;
+    if (lora_a.size() != expected_a || lora_b.size() != expected_b) {
+        LOG_ERR("sync: %s size mismatch! lora_a=%zu (expect %zu), lora_b=%zu (expect %zu)\n",
+                name, lora_a.size(), expected_a, lora_b.size(), expected_b);
+    }
 
     for (int e = 0; e < n_experts; e++) {
         size_t a_offset = e * expert_a_size;
@@ -69,16 +97,25 @@ static void sync_projection_data(
 
         if (a_offset + expert_a_size <= lora_a.size()) {
             ggml_backend_tensor_set(mw->expert_a[e], lora_a.data() + a_offset, 0, expert_a_size * sizeof(float));
+        } else {
+            LOG_ERR("sync: %s expert %d lora_a copy skipped (offset=%zu + size=%zu > %zu)\n",
+                    name, e, a_offset, expert_a_size, lora_a.size());
         }
         if (b_offset + expert_b_size <= lora_b.size()) {
             ggml_backend_tensor_set(mw->expert_b[e], lora_b.data() + b_offset, 0, expert_b_size * sizeof(float));
+        } else {
+            LOG_ERR("sync: %s expert %d lora_b copy skipped (offset=%zu + size=%zu > %zu)\n",
+                    name, e, b_offset, expert_b_size, lora_b.size());
         }
     }
 
     size_t router_size = in_dim * n_experts;
-    if (router.size() >= router_size) {
-        ggml_backend_tensor_set(mw->router_w, router.data(), 0, router_size * sizeof(float));
+    if (router.size() != router_size) {
+        LOG_ERR("sync: %s router size mismatch! have=%zu, need=%zu\n",
+                name, router.size(), router_size);
+        return;
     }
+    ggml_backend_tensor_set(mw->router_w, router.data(), 0, router_size * sizeof(float));
 }
 
 bool sync_lora_mixer_to_adapter(
@@ -156,6 +193,23 @@ bool sync_lora_mixer_to_adapter(
     // Phase 2: Copy data to GPU tensors
     int synced = 0;
 
+    // DEBUG: Layer 23 weights 범위 체크 (sync 전)
+    if (n_layers > 23 && g_weights->layers[23].initialized) {
+        auto & lw23 = g_weights->layers[23];
+        auto print_range = [](const std::vector<float>& v, const char* name) {
+            if (v.empty()) return;
+            float min_v = v[0], max_v = v[0];
+            for (float x : v) { min_v = std::min(min_v, x); max_v = std::max(max_v, x); }
+            LOG_INF("[SYNC-DBG] L23 %s: min=%.4f max=%.4f\n", name, min_v, max_v);
+        };
+        print_range(lw23.q_lora_a, "q_lora_a");
+        print_range(lw23.q_lora_b, "q_lora_b");
+        print_range(lw23.o_lora_a, "o_lora_a");
+        print_range(lw23.o_lora_b, "o_lora_b");
+        print_range(lw23.router_w, "router_w");
+        print_range(lw23.o_router_w, "o_router_w");  // O projection router
+    }
+
     for (int l = 0; l < n_layers && l < (int)g_weights->layers.size(); l++) {
         auto & lw = g_weights->layers[l];
         if (!lw.initialized) continue;
@@ -175,7 +229,7 @@ bool sync_lora_mixer_to_adapter(
                              n_experts, n_embd, rank, kv_out_dim);
 
         snprintf(name, sizeof(name), "blk.%d.attn_output.weight", l);
-        sync_projection_data(adapter, name, lw.o_lora_a, lw.o_lora_b, lw.router_w,
+        sync_projection_data(adapter, name, lw.o_lora_a, lw.o_lora_b, lw.o_router_w,
                              n_experts, q_out_dim, rank, n_embd);
 
         synced++;

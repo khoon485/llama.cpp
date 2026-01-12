@@ -245,7 +245,10 @@ struct ggml_tensor * build_rsl_loss(
     ggml_set_name(balance_loss, "balance_loss");
 
     // Term 2: Entropy Regularizer = -sum(p * log(p)) / n_tokens
-    struct ggml_tensor * log_probs = ggml_log(ggml_ctx, router_probs);
+    // log(0) = -inf 방지: probs + eps
+    struct ggml_tensor * eps = ggml_fill(ggml_ctx, ggml_new_tensor_1d(ggml_ctx, GGML_TYPE_F32, 1), 1e-10f);
+    struct ggml_tensor * probs_safe = ggml_add(ggml_ctx, router_probs, eps);
+    struct ggml_tensor * log_probs = ggml_log(ggml_ctx, probs_safe);
     struct ggml_tensor * p_log_p = ggml_mul(ggml_ctx, router_probs, log_probs);
     struct ggml_tensor * neg_entropy_sum = ggml_sum(ggml_ctx, p_log_p);
     struct ggml_tensor * mean_entropy = ggml_scale(ggml_ctx, neg_entropy_sum, -1.0f / n_tokens);

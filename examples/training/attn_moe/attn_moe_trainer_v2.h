@@ -1,5 +1,10 @@
-// attn_moe_trainer.h - LoRA-Mixer 스타일 Attention MoE 학습 루프
-// End-to-end 학습: Standard CE loss + RSL loss
+// attn_moe_trainer_v2.h - LoRA-Mixer v2 with proper Cross-Entropy Loss
+//
+// Changes from v1:
+// - Uses actual target tokens instead of gradients
+// - Implements proper CE loss: output -> lm_head -> logits -> CE
+// - Adds L_preserve (expert preservation loss)
+// - Follows LoRA-Mixer paper Equation (8): L_total = L_task + α·L_RSL + β·L_preserve
 #pragma once
 
 #include "llama.h"
@@ -12,22 +17,14 @@
 #include <functional>
 
 // ============================================================================
-// Loss 타입 (CE, DPO, GRPO 등)
+// Attention MoE 학습 설정 v2
 // ============================================================================
-enum attn_moe_loss_type {
-    LOSS_CE,        // Cross Entropy (기본)
-    LOSS_DPO,       // Direct Preference Optimization
-    LOSS_GRPO,      // Group Relative Policy Optimization (TODO)
-};
-
-// ============================================================================
-// Attention MoE 학습 설정
-// ============================================================================
-struct attn_moe_train_config {
+struct attn_moe_train_config_v2 {
     int n_layers;           // number of layers to train
     int n_experts;          // number of experts
     int n_expert_used;      // inference top-k
     int n_embd;             // hidden dimension
+    int n_vocab;            // vocabulary size (for CE loss)
     int n_head;             // attention heads
     int n_head_kv;          // KV heads (GQA)
     int head_dim;           // head dimension (from model)
@@ -36,20 +33,11 @@ struct attn_moe_train_config {
     int epochs;             // total training epochs
     float lr;               // learning rate
     float lora_alpha;       // LoRA alpha (scaling)
+
+    // Loss weights (paper Equation 8)
     float rsl_alpha;        // RSL balance loss weight (default 1.0)
     float rsl_lambda;       // RSL entropy penalty weight (default 0.1)
-
-    // Loss 설정
-    enum attn_moe_loss_type loss_type;  // CE, DPO, GRPO
-    float dpo_beta;         // DPO temperature (default 0.1)
-
-    // DPO 데이터 (loss_type == LOSS_DPO일 때 사용)
-    const all_layer_hidden_states * chosen_states;   // chosen forward hidden states
-    const all_layer_hidden_states * rejected_states; // rejected forward hidden states
-    const std::vector<float> * chosen_grad;          // chosen CE gradient (from lm_head)
-    const std::vector<float> * rejected_grad;        // rejected CE gradient
-    float logp_chosen;                               // log prob of chosen sequence
-    float logp_rejected;                             // log prob of rejected sequence
+    float beta;             // Preservation loss weight (default 0.01)
 
     // progress callback
     std::function<void(int epoch, int layer, float loss)> progress_callback;
@@ -58,66 +46,65 @@ struct attn_moe_train_config {
 // ============================================================================
 // Attention MoE 학습 결과
 // ============================================================================
-struct attn_moe_train_result {
+struct attn_moe_train_result_v2 {
     float initial_loss;     // 학습 전 loss
     float final_loss;       // 학습 후 loss
+    float avg_task_loss;    // average task loss (CE)
+    float avg_rsl_loss;     // average RSL loss
+    float avg_preserve_loss; // average preservation loss
     int total_epochs;
     int total_layers;
     bool success;
 };
 
 // ============================================================================
-// 학습 함수
+// 학습 함수 v2
 // ============================================================================
 
-// Attention MoE 학습 실행
-// - hidden_states에서 각 레이어의 attention 입력 사용
-// - initial_grad는 lm_head에서 역전파된 CE gradient
-// - 레이어별로 forward-backward-update 수행
-bool run_attn_moe_training(
+// Attention MoE 학습 실행 v2
+// - model: llama_model (for lm_head and output_norm access)
+// - hidden_states: captured hidden states from each layer
+// - target_tokens: actual target tokens for CE loss
+// - Implements proper CE loss: hidden -> output_norm -> lm_head -> CE
+bool run_attn_moe_training_v2(
     struct llama_adapter_lora * lora,
+    const llama_model * model,
     const all_layer_hidden_states & hidden_states,
-    const std::vector<float> & initial_grad,
-    const attn_moe_train_config & config,
-    attn_moe_train_result * result = nullptr);
+    const std::vector<llama_token> & target_tokens,
+    const attn_moe_train_config_v2 & config,
+    attn_moe_train_result_v2 * result = nullptr);
 
-// Attention MoE 어댑터 초기화
-// - router weights + Q,K,V,O expert weights per layer
-// - 기존 adapter에 새로운 텐서 추가
-bool init_attn_moe_adapter(
+// Attention MoE 어댑터 초기화 (v1과 동일)
+bool init_attn_moe_adapter_v2(
     struct llama_adapter_lora * adapter,
     const llama_model * model,
-    const attn_moe_train_config & config);
+    const attn_moe_train_config_v2 & config);
 
-// 학습된 weights를 adapter에 동기화
-void sync_attn_moe_to_adapter(
+// 학습된 weights를 adapter에 동기화 (v1과 동일)
+void sync_attn_moe_to_adapter_v2(
     struct attn_moe_train_context * ctx,
     struct llama_adapter_lora * adapter,
     int layer_idx);
 
-// g_weights에서 adapter moe_map으로 모든 레이어 동기화
-// 이 함수가 호출되면 다음 llama_decode()에서 학습된 가중치가 반영됨
-// See attn_moe_sync.h for sync_lora_mixer_to_adapter()
-
 // ============================================================================
-// 유틸리티 함수
+// 유틸리티 함수 (v1과 동일)
 // ============================================================================
 
 // LoRA weights Kaiming 초기화
-void init_lora_weights_kaiming(
+void init_lora_weights_kaiming_v2(
     std::vector<float> & data,
     int fan_in,
     int fan_out,
-    bool is_a);  // true: lora_a (input projection), false: lora_b (output, zero-init)
+    bool is_a);
 
 // Router weights 초기화 (작은 random)
-void init_router_weights_small(
+void init_router_weights_small_v2(
     std::vector<float> & data,
     int n_embd,
     int n_experts);
 
 // Top-k 마스크 계산 (inference용)
-void compute_topk_mask(
+void compute_topk_mask_v2(
     const float * router_logits,
     float * mask,
     int n_experts,

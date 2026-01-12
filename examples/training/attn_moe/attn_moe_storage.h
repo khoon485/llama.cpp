@@ -5,7 +5,8 @@
 
 // Layer weights (persistent across epochs)
 struct lora_mixer_layer_weights {
-    std::vector<float> router_w;   // [n_embd, n_experts]
+    std::vector<float> router_w;   // [n_embd, n_experts] for Q,K,V
+    std::vector<float> o_router_w; // [q_out_dim, n_experts] for O projection
     std::vector<float> q_lora_a;   // [n_embd * rank * n_experts]
     std::vector<float> q_lora_b;   // [rank * q_out_dim * n_experts]
     std::vector<float> k_lora_a;
@@ -43,6 +44,7 @@ struct adam_state;
 
 struct lora_mixer_adam_states {
     std::vector<adam_state> router;
+    std::vector<adam_state> o_router;  // O projection용 별도 router
     std::vector<adam_state> q_a, q_b;
     std::vector<adam_state> k_a, k_b;
     std::vector<adam_state> v_a, v_b;
