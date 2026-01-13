@@ -556,6 +556,16 @@ int main(int argc, char ** argv) {
                  epoch + 1, n_epochs, epoch_metrics.dpo_loss, epoch_metrics.reward_margin,
                  epoch_metrics.reward_accuracy * 100.0f);
 
+        // Save epoch checkpoint
+        std::string epoch_path = output_path;
+        size_t ep_pos = epoch_path.rfind(".gguf");
+        epoch_path = (ep_pos != std::string::npos)
+            ? epoch_path.substr(0, ep_pos) + "_epoch" + std::to_string(epoch + 1) + ".gguf"
+            : epoch_path + "_epoch" + std::to_string(epoch + 1) + ".gguf";
+        if (save_dpo_lora(epoch_path, lora_a, lora_b, n_embd, rank, alpha)) {
+            log_both("  Saved: %s\n", epoch_path.c_str());
+        }
+
         if (epoch_metrics.dpo_loss < best_loss) {
             best_loss = epoch_metrics.dpo_loss;
             best_lora_a = lora_a;
@@ -564,10 +574,8 @@ int main(int argc, char ** argv) {
         }
     }
 
-    // Save
-    log_both("\n=== Saving LoRA ===\n");
-    if (save_dpo_lora(output_path, lora_a, lora_b, n_embd, rank, alpha))
-        log_both("Last: %s\n", output_path.c_str());
+    // Save best
+    log_both("\n=== Saving Best LoRA ===\n");
     if (!best_lora_a.empty() && save_dpo_lora(best_path, best_lora_a, best_lora_b, n_embd, rank, alpha))
         log_both("Best: %s (loss=%.4f)\n", best_path.c_str(), best_loss);
 
