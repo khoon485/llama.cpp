@@ -143,3 +143,22 @@ a.out.*
 *_backup_*
 *.txt
 examples/training/__pycache__/
+
+# Training related temporary files and documentation
+--output
+examples/training/--model
+examples/training/CLEANUP.md
+examples/training/MOE_GRADIENT_VERIFICATION.md
+examples/training/NEXT_SESSION_GUIDE.md
+examples/training/NOTES.md
+examples/training/test_3d_forward.cpp
+examples/training/test_ce_loss.cpp
+examples/training/test_dpo_gradient.cpp
+examples/training/test_loss_formula.cpp
+examples/training/test_moe_gradient.cpp
+
+# Training test and docs folders
+examples/training/test/
+examples/training/dpo/
+examples/training/docs/
+examples/training/*.md
