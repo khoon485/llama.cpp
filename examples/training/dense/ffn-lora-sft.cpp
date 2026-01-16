@@ -1,11 +1,10 @@
-// ffn-lora-dpo.cpp - FFN Down LoRA DPO Trainer (전략 A: 정확한 inference 경로)
+// ffn-lora-sft.cpp - FFN Down LoRA SFT Trainer
 //
-// FFN down에 LoRA 적용, inference와 100% 일치하는 학습 경로
-// 훈련된 LoRA는 llama-cli --lora로 로드 가능
+// FFN down에 LoRA 적용, Cross-entropy loss로 직접 지식 학습
+// DPO 코드 기반, rejected 없이 chosen만 사용
 //
 // Usage:
-//   ./llama-ffn-lora-dpo --config train.json
-//   ./llama-ffn-lora-dpo -m model.gguf -f data.jsonl --rank 8 -o out.gguf
+//   ./llama-ffn-lora-sft --config train.json
 
 #include "arg.h"
 #include "common.h"
@@ -37,7 +36,6 @@
 #include "../common/progress.h"
 #include "../common/lm_head_utils.h"
 #include "../common/hidden_capture.h"
-#include "dpo_loss.h"
 #include "ffn_lora_train.h"
 
 using json = nlohmann::json;
@@ -45,20 +43,19 @@ using namespace training;
 using namespace training::dense;
 
 // ============================================================================
-// DPO Data
+// SFT Data
 // ============================================================================
 
-struct dpo_pair {
+struct sft_sample {
     std::string prompt;
-    std::string chosen;
-    std::string rejected;
+    std::string completion;
 };
 
-static std::vector<dpo_pair> load_dpo_data(const std::string & path) {
-    std::vector<dpo_pair> data;
+static std::vector<sft_sample> load_sft_data(const std::string & path) {
+    std::vector<sft_sample> data;
     std::ifstream file(path);
     if (!file.is_open()) {
-        LOG_ERR("Failed to open DPO file: %s\n", path.c_str());
+        LOG_ERR("Failed to open SFT file: %s\n", path.c_str());
         return data;
     }
 
@@ -67,18 +64,18 @@ static std::vector<dpo_pair> load_dpo_data(const std::string & path) {
         if (line.empty()) continue;
         try {
             json j = json::parse(line);
-            dpo_pair pair;
-            pair.prompt = j.value("prompt", "");
-            pair.chosen = j.value("chosen", "");
-            pair.rejected = j.value("rejected", "");
-            if (!pair.prompt.empty() && !pair.chosen.empty() && !pair.rejected.empty()) {
-                data.push_back(pair);
+            sft_sample sample;
+            sample.prompt = j.value("prompt", "");
+            // SFT: "completion" 또는 "chosen" 필드 사용
+            sample.completion = j.value("completion", j.value("chosen", ""));
+            if (!sample.prompt.empty() && !sample.completion.empty()) {
+                data.push_back(sample);
             }
         } catch (const json::exception & e) {
             LOG_WRN("Failed to parse line: %s\n", e.what());
         }
     }
-    LOG_INF("Loaded %zu DPO pairs from %s\n", data.size(), path.c_str());
+    LOG_INF("Loaded %zu SFT samples from %s\n", data.size(), path.c_str());
     return data;
 }
 
@@ -86,16 +83,16 @@ static std::vector<dpo_pair> load_dpo_data(const std::string & path) {
 // Config
 // ============================================================================
 
-struct dpo_config {
+struct sft_config {
     std::string model_path;
-    std::string dpo_file;
-    std::string output_path = "./ffn_lora_dpo.gguf";
+    std::string data_file;
+    std::string output_path = "./ffn_lora_sft.gguf";
     std::string lora_in_path;
     int n_epochs = 10;
-    float dpo_beta = 0.1f;
     float lr = 0.0001f;
     int rank = 8;
     float alpha = 32.0f;
+    float val_split = 0.2f;  // Validation split ratio (0.0 = no validation)
 
     bool load(const std::string & path) {
         std::ifstream f(path);
@@ -103,18 +100,104 @@ struct dpo_config {
         try {
             json j = json::parse(f);
             if (j.contains("model")) model_path = j["model"];
-            if (j.contains("dpo_file")) dpo_file = j["dpo_file"];
+            if (j.contains("data_file")) data_file = j["data_file"];
+            if (j.contains("dpo_file")) data_file = j["dpo_file"];  // 호환성
             if (j.contains("output")) output_path = j["output"];
             if (j.contains("lora_in")) lora_in_path = j["lora_in"];
             if (j.contains("epochs")) n_epochs = j["epochs"];
-            if (j.contains("dpo_beta")) dpo_beta = j["dpo_beta"];
             if (j.contains("lr")) lr = j["lr"];
             if (j.contains("rank")) rank = j["rank"];
             if (j.contains("alpha")) alpha = j["alpha"];
+            if (j.contains("val_split")) val_split = j["val_split"];
             return true;
         } catch (...) { return false; }
     }
 };
+
+// ============================================================================
+// Validation 평가 함수
+// ============================================================================
+
+struct val_result {
+    float loss;
+    float avg_log_p;
+    int n_samples;
+};
+
+static val_result evaluate_validation(
+    ggml_backend_t backend,
+    ffn_lora_storage & storage,
+    const std::vector<sft_sample> & val_data,
+    llama_context * ctx,
+    const llama_vocab * vocab,
+    const std::vector<float> & lm_head_f32,
+    int n_vocab,
+    int target_layer
+) {
+    val_result result = {0.0f, 0.0f, 0};
+    hidden_capture cap;
+
+    for (const auto & sample : val_data) {
+        std::string text = sample.prompt + sample.completion;
+
+        // Capture hidden states
+        if (!capture_hidden_states(ctx, vocab, text, cap)) {
+            continue;
+        }
+
+        int n_tokens = cap.n_tokens;
+        if (n_tokens < 2) continue;
+
+        if (cap.ffn_input.empty() || cap.ffn_output.empty() || cap.sa_out.empty()) {
+            continue;
+        }
+
+        // Tokenize for targets
+        int max_tok = llama_n_ctx(ctx);
+        std::vector<llama_token> tokens(max_tok);
+        int n_tok = llama_tokenize(vocab, text.c_str(), text.size(), tokens.data(), max_tok, true, false);
+        if (n_tok < 0) n_tok = max_tok;
+
+        // Create target one-hot
+        std::vector<float> targets(n_vocab * n_tokens, 0.0f);
+        for (int t = 0; t < n_tokens - 1 && t + 1 < n_tok; t++) {
+            int next = tokens[t + 1];
+            if (next >= 0 && next < n_vocab) {
+                targets[next + t * n_vocab] = 1.0f;
+            }
+        }
+
+        // SFT step WITHOUT gradients (compute_grad = false)
+        ffn_lora_step_result res = ffn_lora_sft_step(
+            backend,
+            storage,
+            cap.ffn_input,
+            cap.ffn_output,
+            cap.sa_out,
+            lm_head_f32,
+            targets,
+            n_tokens,
+            n_vocab,
+            target_layer,
+            false   // NO gradients for validation
+        );
+
+        if (std::isnan(res.loss) || std::isinf(res.loss)) {
+            continue;
+        }
+
+        result.loss += res.loss;
+        result.avg_log_p += res.log_p_c;
+        result.n_samples++;
+    }
+
+    if (result.n_samples > 0) {
+        result.loss /= result.n_samples;
+        result.avg_log_p /= result.n_samples;
+    }
+
+    return result;
+}
 
 // ============================================================================
 // Main
@@ -124,7 +207,7 @@ int main(int argc, char ** argv) {
     common_params params;
     params.escape = false;
 
-    dpo_config cfg;
+    sft_config cfg;
     std::string config_path;
 
     // Parse --config first
@@ -149,9 +232,9 @@ int main(int argc, char ** argv) {
         if (arg == "--config" && i + 1 < argc) { i++; }
         else if (arg == "--epochs" && i + 1 < argc) { cfg.n_epochs = std::atoi(argv[++i]); }
         else if (arg == "--lr" && i + 1 < argc) { cfg.lr = std::stof(argv[++i]); }
-        else if (arg == "--dpo-beta" && i + 1 < argc) { cfg.dpo_beta = std::stof(argv[++i]); }
         else if (arg == "--rank" && i + 1 < argc) { cfg.rank = std::atoi(argv[++i]); }
         else if (arg == "--alpha" && i + 1 < argc) { cfg.alpha = std::stof(argv[++i]); }
+        else if (arg == "--val-split" && i + 1 < argc) { cfg.val_split = std::stof(argv[++i]); }
         else if ((arg == "-o" || arg == "--output") && i + 1 < argc) { cfg.output_path = argv[++i]; }
         else if (arg == "--lora-in" && i + 1 < argc) { cfg.lora_in_path = argv[++i]; }
         else { filtered_argv.push_back(argv[i]); }
@@ -160,18 +243,18 @@ int main(int argc, char ** argv) {
     // Env fallback
     const char * env;
     if ((env = std::getenv("EPOCHS"))) cfg.n_epochs = std::atoi(env);
-    if ((env = std::getenv("DPO_BETA"))) cfg.dpo_beta = std::stof(env);
     if ((env = std::getenv("LR"))) cfg.lr = std::stof(env);
     if ((env = std::getenv("RANK"))) cfg.rank = std::atoi(env);
     if ((env = std::getenv("ALPHA"))) cfg.alpha = std::stof(env);
     if ((env = std::getenv("OUTPUT"))) cfg.output_path = env;
     if ((env = std::getenv("LORA_IN"))) cfg.lora_in_path = env;
+    if ((env = std::getenv("VAL_SPLIT"))) cfg.val_split = std::stof(env);
 
     int n_epochs = cfg.n_epochs;
-    float dpo_beta = cfg.dpo_beta;
     float lr = cfg.lr;
     int rank = cfg.rank;
     float alpha = cfg.alpha;
+    float val_split = cfg.val_split;
     std::string output_path = cfg.output_path;
     std::string lora_in_path = cfg.lora_in_path;
 
@@ -188,14 +271,15 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    // DPO file
-    std::string dpo_file = cfg.dpo_file;
-    if (dpo_file.empty()) {
-        if ((env = std::getenv("DPO_FILE"))) dpo_file = env;
-        else if (!params.prompt_file.empty()) dpo_file = params.prompt_file;
+    // Data file
+    std::string data_file = cfg.data_file;
+    if (data_file.empty()) {
+        if ((env = std::getenv("DATA_FILE"))) data_file = env;
+        else if ((env = std::getenv("DPO_FILE"))) data_file = env;
+        else if (!params.prompt_file.empty()) data_file = params.prompt_file;
     }
-    if (dpo_file.empty()) {
-        LOG_ERR("DPO file required: use --config, -f, or DPO_FILE=<path>\n");
+    if (data_file.empty()) {
+        LOG_ERR("Data file required: use --config, -f, or DATA_FILE=<path>\n");
         return 1;
     }
 
@@ -221,31 +305,52 @@ int main(int argc, char ** argv) {
     };
 
     log_both("\n======================================================\n");
-    log_both("  FFN LoRA DPO Trainer (Strategy A: Exact Inference Path)\n");
+    log_both("  FFN LoRA SFT Trainer (Cross-Entropy Loss)\n");
     log_both("======================================================\n\n");
     log_both("Config:\n");
-    log_both("  DPO file:   %s\n", dpo_file.c_str());
+    log_both("  Data file:  %s\n", data_file.c_str());
     log_both("  Output:     %s\n", output_path.c_str());
     if (!lora_in_path.empty()) log_both("  LoRA in:    %s\n", lora_in_path.c_str());
     log_both("  Epochs:     %d\n", n_epochs);
-    log_both("  DPO beta:   %.2f\n", dpo_beta);
     log_both("  LR:         %.6f\n", lr);
     log_both("  LoRA rank:  %d\n", rank);
-    log_both("  LoRA alpha: %.1f\n\n", alpha);
+    log_both("  LoRA alpha: %.1f\n", alpha);
+    log_both("  Val split:  %.1f%%\n\n", val_split * 100);
 
-    // Load DPO data
-    std::vector<dpo_pair> dpo_data = load_dpo_data(dpo_file);
-    if (dpo_data.empty()) {
-        LOG_ERR("No DPO data loaded\n");
+    // Load SFT data
+    std::vector<sft_sample> all_data = load_sft_data(data_file);
+    if (all_data.empty()) {
+        LOG_ERR("No SFT data loaded\n");
         return 1;
+    }
+
+    // Shuffle and split train/val
+    std::mt19937 rng(42);
+    std::shuffle(all_data.begin(), all_data.end(), rng);
+
+    std::vector<sft_sample> train_data;
+    std::vector<sft_sample> val_data;
+
+    if (val_split > 0.0f && val_split < 1.0f) {
+        size_t val_size = (size_t)(all_data.size() * val_split);
+        if (val_size < 1) val_size = 1;  // 최소 1개
+        if (val_size >= all_data.size()) val_size = all_data.size() - 1;  // 최소 train 1개
+
+        val_data.assign(all_data.begin(), all_data.begin() + val_size);
+        train_data.assign(all_data.begin() + val_size, all_data.end());
+
+        LOG_INF("Data split: %zu train, %zu validation (%.1f%%)\n",
+                train_data.size(), val_data.size(), val_split * 100);
+    } else {
+        train_data = all_data;
+        LOG_INF("No validation split (val_split=%.2f)\n", val_split);
     }
 
     // Calculate context
     int max_chars = 0;
-    for (const auto & pair : dpo_data) {
-        int chosen_len = (int)(pair.prompt.size() + pair.chosen.size());
-        int rejected_len = (int)(pair.prompt.size() + pair.rejected.size());
-        max_chars = std::max(max_chars, std::max(chosen_len, rejected_len));
+    for (const auto & sample : all_data) {
+        int len = (int)(sample.prompt.size() + sample.completion.size());
+        max_chars = std::max(max_chars, len);
     }
     int recommended_ctx = (((max_chars / 3) + 64) / 256 + 1) * 256;
     if (params.n_ctx < recommended_ctx) {
@@ -276,7 +381,7 @@ int main(int argc, char ** argv) {
         LOG_ERR("Failed to get ffn_down tensor from model\n");
         return 1;
     }
-    int n_ff = (int)ffn_down_0->ne[0];  // ffn_down: [n_embd, n_ff]
+    int n_ff = (int)ffn_down_0->ne[0];
 
     llama_context_params ctx_params = common_context_params_to_llama(params);
     ctx_params.cb_eval = capture_callback;
@@ -289,7 +394,7 @@ int main(int argc, char ** argv) {
 
     LOG_INF("Model: n_embd=%d, n_vocab=%d, n_layers=%d, n_ff=%d\n", n_embd, n_vocab, n_layers, n_ff);
 
-    // Get model architecture (use training:: to avoid ambiguity)
+    // Get model architecture
     std::string model_arch = training::get_model_arch(model);
     LOG_INF("Architecture: %s\n", model_arch.c_str());
 
@@ -333,229 +438,144 @@ int main(int argc, char ** argv) {
         LOG_INF("Using CUDA backend for training\n");
     }
 
-    // Pre-compute reference logp
-    log_both("\n=== Pre-computing Reference Logp ===\n\n");
-
-    std::vector<float> ref_logp_c(dpo_data.size(), -INFINITY);
-    std::vector<float> ref_logp_r(dpo_data.size(), -INFINITY);
-
-    hidden_capture cap_c, cap_r;
-    auto ref_start = std::chrono::steady_clock::now();
-    int ref_valid = 0;
-
-    for (size_t i = 0; i < dpo_data.size(); i++) {
-        const auto & pair = dpo_data[i];
-        std::string chosen_text = pair.prompt + pair.chosen;
-        std::string rejected_text = pair.prompt + pair.rejected;
-
-        if (!capture_hidden_states(ctx, vocab, chosen_text, cap_c)) continue;
-        if (!capture_hidden_states(ctx, vocab, rejected_text, cap_r)) continue;
-
-        int n_tokens_c = cap_c.n_tokens;
-        int n_tokens_r = cap_r.n_tokens;
-        if (n_tokens_c < 2 || n_tokens_r < 2) continue;
-
-        int max_tok = llama_n_ctx(ctx);
-        std::vector<llama_token> tokens_c(max_tok), tokens_r(max_tok);
-        int n_c = llama_tokenize(vocab, chosen_text.c_str(), chosen_text.size(), tokens_c.data(), max_tok, true, false);
-        int n_r = llama_tokenize(vocab, rejected_text.c_str(), rejected_text.size(), tokens_r.data(), max_tok, true, false);
-        if (n_c < 0) n_c = max_tok;
-        if (n_r < 0) n_r = max_tok;
-
-        std::vector<float> targets_c(n_vocab * n_tokens_c, 0.0f);
-        std::vector<float> targets_r(n_vocab * n_tokens_r, 0.0f);
-        for (int t = 0; t < n_tokens_c - 1 && t + 1 < n_c; t++) {
-            int next = tokens_c[t + 1];
-            if (next >= 0 && next < n_vocab) targets_c[next + t * n_vocab] = 1.0f;
-        }
-        for (int t = 0; t < n_tokens_r - 1 && t + 1 < n_r; t++) {
-            int next = tokens_r[t + 1];
-            if (next >= 0 && next < n_vocab) targets_r[next + t * n_vocab] = 1.0f;
-        }
-
-        ref_logp_c[i] = compute_ref_logp(train_backend, cap_c.data, lm_head_f32, targets_c, n_embd, n_vocab, n_tokens_c);
-        ref_logp_r[i] = compute_ref_logp(train_backend, cap_r.data, lm_head_f32, targets_r, n_embd, n_vocab, n_tokens_r);
-
-        if (!std::isinf(ref_logp_c[i]) && !std::isinf(ref_logp_r[i])) ref_valid++;
-
-        auto now = std::chrono::steady_clock::now();
-        double elapsed = std::chrono::duration<double>(now - ref_start).count();
-        print_progress_dpo(0, 1, (int)i + 1, (int)dpo_data.size(), 0.0f, 0.0f, elapsed, -1.0f, "Ref");
-    }
-    std::cout << std::endl;
-    fflush(stdout);
-    log_both("Reference logp computed: %d/%zu valid samples\n\n", ref_valid, dpo_data.size());
-    fflush(stdout);
-
     // Training loop
-    log_both("=== Starting FFN LoRA DPO Training (Layer %d) ===\n\n", target_layer);
-    fflush(stdout);
-    log_both("LoRA scale: %.4f (alpha/rank = %.1f/%d)\n\n", alpha / (float)rank, alpha, rank);
-    log_both("Training path: ffn_geglu → LoRA_delta → ffn_post_norm → residual → result_norm → logits\n\n");
+    log_both("\n=== Starting FFN LoRA SFT Training (Layer %d) ===\n\n", target_layer);
+    log_both("LoRA scale: %.4f (alpha/rank = %.1f/%d)\n", alpha / (float)rank, alpha, rank);
+    log_both("Train samples: %zu, Val samples: %zu\n\n", train_data.size(), val_data.size());
 
-    std::vector<size_t> indices(dpo_data.size());
+    std::vector<size_t> indices(train_data.size());
     std::iota(indices.begin(), indices.end(), 0);
-    std::mt19937 rng(42);
 
-    float best_loss = std::numeric_limits<float>::max();
+    float best_val_loss = std::numeric_limits<float>::max();
     ffn_lora_storage best_storage;
     std::string best_path = output_path;
     size_t gguf_pos = best_path.rfind(".gguf");
     best_path = (gguf_pos != std::string::npos) ? best_path.substr(0, gguf_pos) + "_best.gguf" : best_path + "_best.gguf";
 
+    hidden_capture cap;
+
     for (int epoch = 0; epoch < n_epochs; epoch++) {
         std::shuffle(indices.begin(), indices.end(), rng);
-        dpo_metrics epoch_metrics;
-        epoch_metrics.reset();
+
+        float epoch_loss = 0.0f;
+        float epoch_log_p = 0.0f;
+        int n_samples = 0;
+
         auto epoch_start = std::chrono::steady_clock::now();
 
-        int skip_inf = 0, skip_cap_c = 0, skip_cap_r = 0, skip_tokens = 0, skip_loss = 0;
-
-        for (size_t ii = 0; ii < dpo_data.size(); ii++) {
+        // Training loop
+        for (size_t ii = 0; ii < train_data.size(); ii++) {
             size_t i = indices[ii];
-            if (std::isinf(ref_logp_c[i]) || std::isinf(ref_logp_r[i])) {
-                skip_inf++;
+            const auto & sample = train_data[i];
+            std::string text = sample.prompt + sample.completion;
+
+            // Capture hidden states
+            if (!capture_hidden_states(ctx, vocab, text, cap)) {
                 continue;
             }
 
-            const auto & pair = dpo_data[i];
-            std::string chosen_text = pair.prompt + pair.chosen;
-            std::string rejected_text = pair.prompt + pair.rejected;
-
-            // Capture hidden states (including ffn_geglu, ffn_out, sa_out)
-            if (!capture_hidden_states(ctx, vocab, chosen_text, cap_c)) {
-                skip_cap_c++;
-                continue;
-            }
-            if (!capture_hidden_states(ctx, vocab, rejected_text, cap_r)) {
-                skip_cap_r++;
-                continue;
-            }
-
-            int n_tokens_c = cap_c.n_tokens;
-            int n_tokens_r = cap_r.n_tokens;
-            if (n_tokens_c < 2 || n_tokens_r < 2) {
-                skip_tokens++;
-                continue;
-            }
+            int n_tokens = cap.n_tokens;
+            if (n_tokens < 2) continue;
 
             // Check captured tensors
-            if (cap_c.ffn_input.empty() || cap_r.ffn_input.empty() ||
-                cap_c.ffn_output.empty() || cap_r.ffn_output.empty() ||
-                cap_c.sa_out.empty() || cap_r.sa_out.empty()) {
-                skip_cap_c++;
+            if (cap.ffn_input.empty() || cap.ffn_output.empty() || cap.sa_out.empty()) {
                 continue;
             }
 
+            // Tokenize for targets
             int max_tok = llama_n_ctx(ctx);
-            std::vector<llama_token> tokens_c(max_tok), tokens_r(max_tok);
-            int n_c = llama_tokenize(vocab, chosen_text.c_str(), chosen_text.size(), tokens_c.data(), max_tok, true, false);
-            int n_r = llama_tokenize(vocab, rejected_text.c_str(), rejected_text.size(), tokens_r.data(), max_tok, true, false);
-            if (n_c < 0) n_c = max_tok;
-            if (n_r < 0) n_r = max_tok;
+            std::vector<llama_token> tokens(max_tok);
+            int n_tok = llama_tokenize(vocab, text.c_str(), text.size(), tokens.data(), max_tok, true, false);
+            if (n_tok < 0) n_tok = max_tok;
 
-            std::vector<float> targets_c(n_vocab * n_tokens_c, 0.0f);
-            std::vector<float> targets_r(n_vocab * n_tokens_r, 0.0f);
-            for (int t = 0; t < n_tokens_c - 1 && t + 1 < n_c; t++) {
-                int next = tokens_c[t + 1];
-                if (next >= 0 && next < n_vocab) targets_c[next + t * n_vocab] = 1.0f;
-            }
-            for (int t = 0; t < n_tokens_r - 1 && t + 1 < n_r; t++) {
-                int next = tokens_r[t + 1];
-                if (next >= 0 && next < n_vocab) targets_r[next + t * n_vocab] = 1.0f;
-            }
-
-            // DEBUG: 캡처된 값 비교
-            static int debug_cap = 0;
-            if (debug_cap < 1) {
-                float ref_ce = compute_ref_logp(train_backend, cap_c.data, lm_head_f32, targets_c, n_embd, n_vocab, n_tokens_c);
-                fprintf(stderr, "\n[DEBUG CAP] ref_logp from cap.data = %.4f (should match ref_logp_c[%zu]=%.4f)\n",
-                        ref_ce, i, ref_logp_c[i]);
-                fprintf(stderr, "[DEBUG CAP] n_tokens_c=%d, ffn_input.size=%zu, ffn_output.size=%zu\n",
-                        n_tokens_c, cap_c.ffn_input.size(), cap_c.ffn_output.size());
-                fprintf(stderr, "[DEBUG CAP] target_layer=%d, ffn_post_norm_layer=%d, l_out_layer=%d\n",
-                        cap_c.target_layer, cap_c.ffn_post_norm_layer, cap_c.l_out_layer);
-                // cap.data (result_norm) sum
-                float cap_data_sum = 0;
-                for (int k = 0; k < n_embd && k < (int)cap_c.data.size(); k++) {
-                    cap_data_sum += std::abs(cap_c.data[k]);
+            // Create target one-hot
+            std::vector<float> targets(n_vocab * n_tokens, 0.0f);
+            for (int t = 0; t < n_tokens - 1 && t + 1 < n_tok; t++) {
+                int next = tokens[t + 1];
+                if (next >= 0 && next < n_vocab) {
+                    targets[next + t * n_vocab] = 1.0f;
                 }
-                fprintf(stderr, "[DEBUG CAP] cap.data (result_norm) sum[0:n_embd] = %.4f\n", cap_data_sum);
-                debug_cap++;
             }
 
-            // Training step
-            ffn_lora_step_result res = ffn_lora_dpo_step(
+            // SFT step: CE loss 직접 사용
+            ffn_lora_step_result res = ffn_lora_sft_step(
                 train_backend,
                 storage,
-                cap_c.ffn_input,   // ffn_geglu chosen
-                cap_r.ffn_input,   // ffn_geglu rejected
-                cap_c.ffn_output,  // ffn_out chosen
-                cap_r.ffn_output,  // ffn_out rejected
-                cap_c.sa_out,      // sa_out chosen
-                cap_r.sa_out,      // sa_out rejected
+                cap.ffn_input,   // ffn_geglu
+                cap.ffn_output,  // ffn_out
+                cap.sa_out,      // sa_out
                 lm_head_f32,
-                targets_c, targets_r,
-                n_tokens_c, n_tokens_r,
+                targets,
+                n_tokens,
                 n_vocab,
-                dpo_beta,
-                ref_logp_c[i],
-                ref_logp_r[i],
                 target_layer,
-                true,  // compute gradients
-                cap_c.data,  // 디버그용: 캡처된 result_norm
-                cap_c.ffn_post_norm_out,  // 디버그용: 캡처된 ffn_post_norm
-                cap_c.l_out  // 디버그용: 캡처된 l_out (output_norm 전)
+                true   // compute gradients
             );
 
             if (std::isnan(res.loss) || std::isinf(res.loss)) {
-                skip_loss++;
                 continue;
             }
+
+            // SFT loss = CE (res.loss가 이미 CE)
+            float ce_loss = res.loss;
 
             // Apply gradients
             apply_ffn_lora_gradients(storage, res, target_layer, lr);
 
-            // DEBUG: 실제 log_p 값 출력
-            static int debug_logp = 0;
-            if (debug_logp < 3) {
-                fprintf(stderr, "\n[DEBUG LOGP %d] log_p_c=%.4f, log_p_r=%.4f, ref_c=%.4f, ref_r=%.4f\n",
-                        debug_logp, res.log_p_c, res.log_p_r, ref_logp_c[i], ref_logp_r[i]);
-                fprintf(stderr, "[DEBUG LOGP %d] margin = (%.4f - %.4f) - (%.4f - %.4f) = %.4f\n",
-                        debug_logp, res.log_p_c, ref_logp_c[i], res.log_p_r, ref_logp_r[i],
-                        (res.log_p_c - ref_logp_c[i]) - (res.log_p_r - ref_logp_r[i]));
-                debug_logp++;
-            }
-            epoch_metrics.update(res.log_p_c, res.log_p_r, ref_logp_c[i], ref_logp_r[i], res.loss);
+            epoch_loss += ce_loss;
+            epoch_log_p += res.log_p_c;
+            n_samples++;
 
+            // Progress
             auto now = std::chrono::steady_clock::now();
             double elapsed = std::chrono::duration<double>(now - epoch_start).count();
-            print_progress_dpo(epoch, n_epochs, (int)ii + 1, (int)dpo_data.size(),
-                             epoch_metrics.sum_loss / epoch_metrics.n_samples,
-                             epoch_metrics.sum_margin / epoch_metrics.n_samples,
-                             elapsed,
-                             (float)epoch_metrics.n_correct / epoch_metrics.n_samples);
-        }
-        std::cout << std::endl;
+            double speed = (ii + 1) / elapsed;
+            double eta = (train_data.size() - ii - 1) / speed;
 
-        int total_skip = skip_inf + skip_cap_c + skip_cap_r + skip_tokens + skip_loss;
-        if (total_skip > 0) {
-            log_both("  Skipped: %d (inf:%d cap_c:%d cap_r:%d tokens:%d loss:%d)\n",
-                    total_skip, skip_inf, skip_cap_c, skip_cap_r, skip_tokens, skip_loss);
+            printf("\rE%d/%d [", epoch + 1, n_epochs);
+            int bar_width = 20;
+            int filled = (int)((ii + 1) * bar_width / train_data.size());
+            for (int b = 0; b < bar_width; b++) {
+                printf(b < filled ? "=" : (b == filled ? ">" : " "));
+            }
+            printf("] %3d%% %zu/%zu [%.0fs<%.0fs, %.2fit/s] L:%.3f",
+                   (int)((ii + 1) * 100 / train_data.size()),
+                   ii + 1, train_data.size(),
+                   elapsed, eta, speed,
+                   epoch_loss / n_samples);
+            fflush(stdout);
         }
+        printf("\n");
 
-        if (epoch_metrics.n_samples == 0) {
+        if (n_samples == 0) {
             log_both("Epoch %d: no valid samples\n", epoch + 1);
             continue;
         }
-        epoch_metrics.finalize();
 
-        log_both("Epoch %2d/%d: loss=%.4f margin=%.4f acc=%.1f%% [%d/%zu samples]\n",
-                epoch + 1, n_epochs,
-                epoch_metrics.dpo_loss,
-                epoch_metrics.reward_margin,
-                epoch_metrics.reward_accuracy * 100.0f,
-                epoch_metrics.n_samples, dpo_data.size());
+        float avg_train_loss = epoch_loss / n_samples;
+        float avg_log_p = epoch_log_p / n_samples;
+
+        // Validation
+        float avg_val_loss = 0.0f;
+        if (!val_data.empty()) {
+            printf("  Validating...");
+            fflush(stdout);
+
+            val_result val = evaluate_validation(
+                train_backend, storage, val_data,
+                ctx, vocab, lm_head_f32, n_vocab, target_layer
+            );
+
+            avg_val_loss = val.loss;
+            printf("\r                \r");  // Clear "Validating..."
+
+            log_both("Epoch %2d/%d: train_loss=%.4f val_loss=%.4f [train:%d val:%d]\n",
+                    epoch + 1, n_epochs, avg_train_loss, avg_val_loss,
+                    n_samples, val.n_samples);
+        } else {
+            log_both("Epoch %2d/%d: train_loss=%.4f [%d samples]\n",
+                    epoch + 1, n_epochs, avg_train_loss, n_samples);
+        }
 
         // Save per-epoch checkpoint
         std::string epoch_path = output_path;
@@ -567,12 +587,17 @@ int main(int argc, char ** argv) {
             log_both("  -> Saved epoch checkpoint: %s\n", epoch_path.c_str());
         }
 
-        // Track best
-        if (epoch == 0 || (epoch_metrics.dpo_loss < best_loss && epoch_metrics.reward_margin < 10.0f)) {
-            best_loss = epoch_metrics.dpo_loss;
-            best_storage = storage;  // Copy current weights
+        // Track best (use val_loss if available, otherwise train_loss)
+        float metric_for_best = val_data.empty() ? avg_train_loss : avg_val_loss;
+        if (metric_for_best < best_val_loss) {
+            best_val_loss = metric_for_best;
+            best_storage = storage;
             if (save_ffn_lora_gguf(best_storage, model_arch.c_str(), best_path.c_str(), target_layer)) {
-                log_both("  -> New best (margin=%.2f)! Saved: %s\n", epoch_metrics.reward_margin, best_path.c_str());
+                if (val_data.empty()) {
+                    log_both("  -> New best (train_loss=%.4f)! Saved: %s\n", metric_for_best, best_path.c_str());
+                } else {
+                    log_both("  -> New best (val_loss=%.4f)! Saved: %s\n", metric_for_best, best_path.c_str());
+                }
             }
         }
     }
@@ -583,9 +608,9 @@ int main(int argc, char ** argv) {
         log_both("Saved: %s\n", output_path.c_str());
     }
 
-    // Print summary
     log_both("\n=== Training Complete ===\n");
     log_both("Tensor saved: blk.%d.ffn_down.weight.lora_a/b\n", target_layer);
+    log_both("Best model: %s (loss=%.4f)\n", best_path.c_str(), best_val_loss);
     log_both("To use: llama-cli -m <model> --lora %s\n\n", output_path.c_str());
 
     log_both("Done!\n");

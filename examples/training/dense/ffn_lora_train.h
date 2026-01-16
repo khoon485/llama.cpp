@@ -913,5 +913,230 @@ inline bool load_ffn_lora_gguf(ffn_lora_storage & storage, const char * path) {
     return true;
 }
 
+// ============================================================================
+// SFT Training Step - Cross-Entropy Loss 직접 사용
+//
+// DPO와 달리 chosen만 사용, softplus 없이 CE를 직접 loss로 설정
+// ============================================================================
+
+inline ffn_lora_step_result ffn_lora_sft_step(
+    ggml_backend_t backend,
+    ffn_lora_storage & storage,
+    const std::vector<float> & ffn_geglu,     // [n_ff * n_tokens]
+    const std::vector<float> & ffn_out,       // [n_embd * n_tokens]
+    const std::vector<float> & sa_out,        // [n_embd * n_tokens]
+    const std::vector<float> & lm_head_data,  // [n_embd * n_vocab]
+    const std::vector<float> & targets,       // [n_vocab * n_tokens]
+    int n_tokens,
+    int n_vocab,
+    int target_layer,
+    bool compute_grad
+) {
+    ffn_lora_step_result result;
+    result.loss = INFINITY;
+
+    const auto & cfg = storage.cfg;
+    int n_embd = cfg.n_embd;
+    int n_ff = cfg.n_ff;
+    int rank = cfg.rank;
+    float scale = cfg.scale();
+    float eps = cfg.rms_norm_eps;
+
+    int layer_idx = (target_layer < 0) ? (cfg.n_layers - 1) : target_layer;
+    if (layer_idx >= cfg.n_layers) return result;
+
+    // 입력 검증
+    if (ffn_geglu.empty() || ffn_out.empty() || sa_out.empty()) {
+        printf("[ffn_lora_sft] ERROR: empty input tensors\n");
+        return result;
+    }
+
+    // GGML context
+    size_t ctx_size = 512 * 1024 * 1024;  // 512MB
+    struct ggml_init_params params = { ctx_size, nullptr, true };
+    struct ggml_context * ctx = ggml_init(params);
+    if (!ctx) return result;
+
+    // ============================================================================
+    // Input tensors
+    // ============================================================================
+
+    struct ggml_tensor * t_ffn_in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_ff, n_tokens);
+    struct ggml_tensor * t_ffn_out = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+    struct ggml_tensor * t_sa_out = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+    struct ggml_tensor * t_ffn_post_norm = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_embd);
+    struct ggml_tensor * t_output_norm = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_embd);
+    struct ggml_tensor * t_lm_head = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_vocab);
+    struct ggml_tensor * t_targets = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_vocab, n_tokens);
+
+    ggml_set_input(t_ffn_in);
+    ggml_set_input(t_ffn_out);
+    ggml_set_input(t_sa_out);
+    ggml_set_input(t_ffn_post_norm);
+    ggml_set_input(t_output_norm);
+    ggml_set_input(t_lm_head);
+    ggml_set_input(t_targets);
+
+    // ============================================================================
+    // LoRA parameters
+    // ============================================================================
+
+    struct ggml_tensor * t_lora_a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_ff, rank);
+    struct ggml_tensor * t_lora_b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, rank, n_embd);
+
+    ggml_set_param(t_lora_a);
+    ggml_set_param(t_lora_b);
+
+    // ============================================================================
+    // Forward pass
+    // ============================================================================
+
+    // Step 1: LoRA delta = scale * B @ A @ ffn_geglu
+    struct ggml_tensor * a_in = ggml_mul_mat(ctx, t_lora_a, t_ffn_in);
+    struct ggml_tensor * delta = ggml_mul_mat(ctx, t_lora_b, a_in);
+    delta = ggml_scale(ctx, delta, scale);
+
+    // Step 2: ffn_out' = ffn_out + delta
+    struct ggml_tensor * ffn_out_mod = ggml_add(ctx, t_ffn_out, delta);
+
+    // Step 3: ffn_post_norm
+    struct ggml_tensor * post_norm = ggml_rms_norm(ctx, ffn_out_mod, eps);
+    struct ggml_tensor * ffn_norm_rep = ggml_repeat(ctx, t_ffn_post_norm, post_norm);
+    post_norm = ggml_mul(ctx, post_norm, ffn_norm_rep);
+
+    // Step 4: Residual = sa_out + ffn_post_normed
+    struct ggml_tensor * hidden = ggml_add(ctx, t_sa_out, post_norm);
+
+    // Step 5: result_norm
+    struct ggml_tensor * final_hidden = ggml_rms_norm(ctx, hidden, eps);
+    struct ggml_tensor * out_norm_rep = ggml_repeat(ctx, t_output_norm, final_hidden);
+    final_hidden = ggml_mul(ctx, final_hidden, out_norm_rep);
+
+    // Step 6: Logits
+    struct ggml_tensor * logits = ggml_mul_mat(ctx, t_lm_head, final_hidden);
+
+    // Step 7: Cross-Entropy Loss (SFT 핵심: CE를 직접 loss로 사용)
+    struct ggml_tensor * loss = ggml_cross_entropy_loss(ctx, logits, t_targets);
+
+    // Mark outputs
+    ggml_set_name(loss, "sft_loss");
+    ggml_set_output(loss);
+    ggml_set_loss(loss);
+
+    // ============================================================================
+    // Build forward graph
+    // ============================================================================
+
+    struct ggml_cgraph * gf = ggml_new_graph_custom(ctx, 32768, true);
+    ggml_build_forward_expand(gf, loss);
+
+    // ============================================================================
+    // Setup gradient accumulators
+    // ============================================================================
+
+    int n_nodes = ggml_graph_n_nodes(gf);
+    std::vector<struct ggml_tensor *> grad_accs(n_nodes, nullptr);
+    struct ggml_tensor * grad_loss = nullptr;
+    struct ggml_tensor * grad_a = nullptr;
+    struct ggml_tensor * grad_b = nullptr;
+
+    if (compute_grad) {
+        for (int i = 0; i < n_nodes; i++) {
+            struct ggml_tensor * node = ggml_graph_node(gf, i);
+            if (node->flags & GGML_TENSOR_FLAG_LOSS) {
+                grad_loss = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, node->ne);
+                grad_accs[i] = grad_loss;
+            }
+            if (node == t_lora_a) {
+                grad_a = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, node->ne);
+                grad_accs[i] = grad_a;
+            }
+            if (node == t_lora_b) {
+                grad_b = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, node->ne);
+                grad_accs[i] = grad_b;
+            }
+        }
+    }
+
+    // ============================================================================
+    // Build backward graph
+    // ============================================================================
+
+    struct ggml_cgraph * gb = nullptr;
+    if (compute_grad) {
+        gb = ggml_graph_dup(ctx, gf, true);
+        ggml_build_backward_expand(ctx, gb, grad_accs.data());
+    }
+
+    // ============================================================================
+    // Allocate buffer
+    // ============================================================================
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    if (!buf) {
+        printf("[ffn_lora_sft] ERROR: failed to allocate buffer\n");
+        ggml_free(ctx);
+        return result;
+    }
+
+    // ============================================================================
+    // Set input data
+    // ============================================================================
+
+    ggml_backend_tensor_set(t_ffn_in, ffn_geglu.data(), 0, ffn_geglu.size() * sizeof(float));
+    ggml_backend_tensor_set(t_ffn_out, ffn_out.data(), 0, ffn_out.size() * sizeof(float));
+    ggml_backend_tensor_set(t_sa_out, sa_out.data(), 0, sa_out.size() * sizeof(float));
+    ggml_backend_tensor_set(t_ffn_post_norm, storage.ffn_post_norm_weights[layer_idx].data(), 0, n_embd * sizeof(float));
+    ggml_backend_tensor_set(t_output_norm, storage.output_norm_weights.data(), 0, n_embd * sizeof(float));
+    ggml_backend_tensor_set(t_lm_head, lm_head_data.data(), 0, lm_head_data.size() * sizeof(float));
+    ggml_backend_tensor_set(t_targets, targets.data(), 0, targets.size() * sizeof(float));
+
+    // LoRA weights
+    ggml_backend_tensor_set(t_lora_a, storage.layers[layer_idx].lora_a.data(), 0, n_ff * rank * sizeof(float));
+    ggml_backend_tensor_set(t_lora_b, storage.layers[layer_idx].lora_b.data(), 0, rank * n_embd * sizeof(float));
+
+    // Initialize gradient accumulators
+    if (compute_grad) {
+        float one = 1.0f;
+        ggml_backend_tensor_set(grad_loss, &one, 0, sizeof(float));
+        std::vector<float> zeros_a(n_ff * rank, 0.0f);
+        std::vector<float> zeros_b(rank * n_embd, 0.0f);
+        ggml_backend_tensor_set(grad_a, zeros_a.data(), 0, zeros_a.size() * sizeof(float));
+        ggml_backend_tensor_set(grad_b, zeros_b.data(), 0, zeros_b.size() * sizeof(float));
+    }
+
+    ggml_backend_synchronize(backend);
+
+    // ============================================================================
+    // Forward pass
+    // ============================================================================
+
+    ggml_backend_graph_compute(backend, gf);
+    ggml_backend_synchronize(backend);
+
+    // Get results
+    ggml_backend_tensor_get(loss, &result.loss, 0, sizeof(float));
+    result.log_p_c = -result.loss;  // log_p = -CE
+
+    // ============================================================================
+    // Backward pass
+    // ============================================================================
+
+    if (compute_grad && gb) {
+        ggml_backend_graph_compute(backend, gb);
+        ggml_backend_synchronize(backend);
+
+        result.grad_a.resize(n_ff * rank);
+        result.grad_b.resize(rank * n_embd);
+        ggml_backend_tensor_get(grad_a, result.grad_a.data(), 0, result.grad_a.size() * sizeof(float));
+        ggml_backend_tensor_get(grad_b, result.grad_b.data(), 0, result.grad_b.size() * sizeof(float));
+    }
+
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
+
+    return result;
+}
+
 } // namespace dense
 } // namespace training
