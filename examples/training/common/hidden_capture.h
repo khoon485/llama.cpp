@@ -16,10 +16,14 @@ struct hidden_capture {
     std::vector<float> ffn_input;   // [n_ff * n_tokens] - ffn_geglu (FFN down input)
     std::vector<float> ffn_output;  // [n_embd * n_tokens] - ffn_out (FFN down output, before post_norm)
     std::vector<float> sa_out;      // [n_embd * n_tokens] - sa_out (residual start for FFN)
+    std::vector<float> ffn_post_norm_out;  // [n_embd * n_tokens] - ffn_post_norm 적용 후 (디버그용)
+    std::vector<float> l_out;       // [n_embd * n_tokens] - 레이어 출력 (output_norm 전)
     int n_embd = 0;
     int n_ff = 0;
     int n_tokens = 0;
     int target_layer = -1;  // 마지막 레이어 FFN만 캡처 (-1이면 자동)
+    int ffn_post_norm_layer = -1;  // 마지막으로 캡처된 ffn_post_norm 레이어
+    int l_out_layer = -1;  // 마지막으로 캡처된 l_out 레이어
     bool enabled = false;
     bool captured = false;
     bool ffn_captured = false;
@@ -29,9 +33,14 @@ struct hidden_capture {
         ffn_input.clear();
         ffn_output.clear();
         sa_out.clear();
+        ffn_post_norm_out.clear();
+        l_out.clear();
         n_embd = 0;
         n_ff = 0;
         n_tokens = 0;
+        target_layer = -1;
+        ffn_post_norm_layer = -1;
+        l_out_layer = -1;
         enabled = false;
         captured = false;
         ffn_captured = false;
@@ -53,14 +62,12 @@ inline bool capture_callback(struct ggml_tensor * t, bool ask, void * user_data)
     if (!name) return true;
 
     // Capture sa_out-N (self-attention output + residual, before FFN)
+    // 마지막 레이어를 캡처하기 위해 layer_idx >= target_layer일 때 캡처
     if (strstr(name, "sa_out-")) {
         int layer_idx = -1;
         if (sscanf(name, "sa_out-%d", &layer_idx) == 1) {
-            // target_layer == -1이면 마지막 레이어를 자동 감지
-            if (g_active_capture->target_layer < 0 || layer_idx == g_active_capture->target_layer) {
-                if (layer_idx > g_active_capture->target_layer) {
-                    g_active_capture->target_layer = layer_idx;
-                }
+            if (layer_idx >= g_active_capture->target_layer) {
+                g_active_capture->target_layer = layer_idx;
                 int64_t n_embd = t->ne[0];
                 int64_t n_tokens = t->ne[1];
                 g_active_capture->sa_out.resize(n_embd * n_tokens);
@@ -85,11 +92,8 @@ inline bool capture_callback(struct ggml_tensor * t, bool ask, void * user_data)
                 sscanf(name, "ffn_silu-%d", &layer_idx) != 1) {
                 layer_idx = -1;
             }
-            // target_layer == -1이면 마지막 레이어를 자동 감지 (가장 높은 layer_idx)
-            if (g_active_capture->target_layer < 0 || layer_idx == g_active_capture->target_layer) {
-                if (layer_idx > g_active_capture->target_layer) {
-                    g_active_capture->target_layer = layer_idx;
-                }
+            if (layer_idx >= g_active_capture->target_layer) {
+                g_active_capture->target_layer = layer_idx;
                 int64_t n_ff = t->ne[0];
                 int64_t n_tokens = t->ne[1];
                 g_active_capture->n_ff = (int)n_ff;
@@ -104,15 +108,46 @@ inline bool capture_callback(struct ggml_tensor * t, bool ask, void * user_data)
     if (strstr(name, "ffn_out-")) {
         int layer_idx = -1;
         if (sscanf(name, "ffn_out-%d", &layer_idx) == 1) {
-            if (g_active_capture->target_layer < 0 || layer_idx == g_active_capture->target_layer) {
-                if (layer_idx > g_active_capture->target_layer) {
-                    g_active_capture->target_layer = layer_idx;
-                }
+            if (layer_idx >= g_active_capture->target_layer) {
+                g_active_capture->target_layer = layer_idx;
                 int64_t n_embd = t->ne[0];
                 int64_t n_tokens = t->ne[1];
                 g_active_capture->n_embd = (int)n_embd;
                 g_active_capture->ffn_output.resize(n_embd * n_tokens);
                 ggml_backend_tensor_get(t, g_active_capture->ffn_output.data(), 0,
+                                        n_embd * n_tokens * sizeof(float));
+            }
+        }
+    }
+
+    // Capture ffn_post_norm-N (FFN post norm 적용 후)
+    // 가장 높은 레이어 (마지막 레이어)를 캡처
+    if (strstr(name, "ffn_post_norm-")) {
+        int layer_idx = -1;
+        if (sscanf(name, "ffn_post_norm-%d", &layer_idx) == 1) {
+            // 현재 layer_idx가 지금까지 본 것보다 크면 캡처
+            if (layer_idx > g_active_capture->ffn_post_norm_layer) {
+                g_active_capture->ffn_post_norm_layer = layer_idx;
+                int64_t n_embd = t->ne[0];
+                int64_t n_tokens = t->ne[1];
+                g_active_capture->ffn_post_norm_out.resize(n_embd * n_tokens);
+                ggml_backend_tensor_get(t, g_active_capture->ffn_post_norm_out.data(), 0,
+                                        n_embd * n_tokens * sizeof(float));
+            }
+        }
+    }
+
+    // Capture l_out-N (레이어 출력, output_norm 전)
+    // 가장 높은 레이어 (마지막 레이어)를 캡처
+    if (strstr(name, "l_out-")) {
+        int layer_idx = -1;
+        if (sscanf(name, "l_out-%d", &layer_idx) == 1) {
+            if (layer_idx > g_active_capture->l_out_layer) {
+                g_active_capture->l_out_layer = layer_idx;
+                int64_t n_embd = t->ne[0];
+                int64_t n_tokens = t->ne[1];
+                g_active_capture->l_out.resize(n_embd * n_tokens);
+                ggml_backend_tensor_get(t, g_active_capture->l_out.data(), 0,
                                         n_embd * n_tokens * sizeof(float));
             }
         }

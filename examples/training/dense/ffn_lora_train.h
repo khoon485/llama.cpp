@@ -243,7 +243,10 @@ inline ffn_lora_step_result ffn_lora_dpo_step(
     float ref_logp_c,
     float ref_logp_r,
     int target_layer,  // 학습할 레이어
-    bool compute_grad
+    bool compute_grad,
+    const std::vector<float> & cap_result_norm_c = {},  // 디버그용: 캡처된 result_norm
+    const std::vector<float> & cap_ffn_post_norm_c = {},  // 디버그용: 캡처된 ffn_post_norm
+    const std::vector<float> & cap_l_out_c = {}  // 디버그용: 캡처된 l_out (output_norm 전)
 ) {
     ffn_lora_step_result result;
     result.loss = INFINITY;
@@ -352,11 +355,14 @@ inline ffn_lora_step_result ffn_lora_dpo_step(
     // Step 3: ffn_post_norm (RMS norm * weights)
     // rms_norm(x) = x / sqrt(mean(x^2) + eps)
     // output = rms_norm(x) * weights
+    // ggml_mul은 1D * 2D broadcasting이 안 되므로 repeat 필요
     struct ggml_tensor * post_norm_c = ggml_rms_norm(ctx, ffn_out_mod_c, eps);
-    post_norm_c = ggml_mul(ctx, post_norm_c, t_ffn_post_norm);
+    struct ggml_tensor * ffn_norm_rep_c = ggml_repeat(ctx, t_ffn_post_norm, post_norm_c);
+    post_norm_c = ggml_mul(ctx, post_norm_c, ffn_norm_rep_c);
 
     struct ggml_tensor * post_norm_r = ggml_rms_norm(ctx, ffn_out_mod_r, eps);
-    post_norm_r = ggml_mul(ctx, post_norm_r, t_ffn_post_norm);
+    struct ggml_tensor * ffn_norm_rep_r = ggml_repeat(ctx, t_ffn_post_norm, post_norm_r);
+    post_norm_r = ggml_mul(ctx, post_norm_r, ffn_norm_rep_r);
 
     // Step 4: Residual = sa_out + ffn_post_normed
     struct ggml_tensor * hidden_c = ggml_add(ctx, t_sa_out_c, post_norm_c);
@@ -364,10 +370,12 @@ inline ffn_lora_step_result ffn_lora_dpo_step(
 
     // Step 5: result_norm (output_norm)
     struct ggml_tensor * final_c = ggml_rms_norm(ctx, hidden_c, eps);
-    final_c = ggml_mul(ctx, final_c, t_output_norm);
+    struct ggml_tensor * out_norm_rep_c = ggml_repeat(ctx, t_output_norm, final_c);
+    final_c = ggml_mul(ctx, final_c, out_norm_rep_c);
 
     struct ggml_tensor * final_r = ggml_rms_norm(ctx, hidden_r, eps);
-    final_r = ggml_mul(ctx, final_r, t_output_norm);
+    struct ggml_tensor * out_norm_rep_r = ggml_repeat(ctx, t_output_norm, final_r);
+    final_r = ggml_mul(ctx, final_r, out_norm_rep_r);
 
     // Step 6: Logits = lm_head @ final
     struct ggml_tensor * logits_c = ggml_mul_mat(ctx, t_lm_head, final_c);
@@ -501,23 +509,150 @@ inline ffn_lora_step_result ffn_lora_dpo_step(
     ggml_backend_tensor_get(log_p_r, &result.log_p_r, 0, sizeof(float));
     result.margin = result.log_p_c - result.log_p_r;
 
-    // DEBUG: 중간 값 확인
+    // DEBUG: 중간 값 확인 및 cap.data와 비교
     static int debug_inter = 0;
     if (debug_inter < 1) {
+        // 먼저 입력값 확인
+        fprintf(stderr, "\n[DEBUG INPUT] 입력 tensor 검증:\n");
+        float in_ffn_sum = 0, in_sa_sum = 0;
+        for (int i = 0; i < n_embd && i < (int)ffn_out_c.size(); i++) {
+            in_ffn_sum += std::abs(ffn_out_c[i]);
+            in_sa_sum += std::abs(sa_out_c[i]);
+        }
+        fprintf(stderr, "  ffn_out_c (입력) sum = %.4f\n", in_ffn_sum);
+        fprintf(stderr, "  sa_out_c (입력) sum  = %.4f\n", in_sa_sum);
+        // GPU에 전달된 후 확인
+        std::vector<float> gpu_ffn(n_embd), gpu_sa(n_embd);
+        ggml_backend_tensor_get(t_ffn_out_c, gpu_ffn.data(), 0, n_embd * sizeof(float));
+        ggml_backend_tensor_get(t_sa_out_c, gpu_sa.data(), 0, n_embd * sizeof(float));
+        float gpu_ffn_sum = 0, gpu_sa_sum = 0;
+        for (int i = 0; i < n_embd; i++) {
+            gpu_ffn_sum += std::abs(gpu_ffn[i]);
+            gpu_sa_sum += std::abs(gpu_sa[i]);
+        }
+        fprintf(stderr, "  t_ffn_out_c (GPU) sum = %.4f\n", gpu_ffn_sum);
+        fprintf(stderr, "  t_sa_out_c (GPU) sum  = %.4f\n", gpu_sa_sum);
+
         std::vector<float> delta_vals(n_embd * n_tokens_c);
         std::vector<float> ffn_mod_vals(n_embd * n_tokens_c);
+        std::vector<float> post_norm_vals(n_embd * n_tokens_c);
+        std::vector<float> hidden_vals(n_embd * n_tokens_c);
         std::vector<float> final_vals(n_embd * n_tokens_c);
         ggml_backend_tensor_get(delta_c, delta_vals.data(), 0, delta_vals.size() * sizeof(float));
         ggml_backend_tensor_get(ffn_out_mod_c, ffn_mod_vals.data(), 0, ffn_mod_vals.size() * sizeof(float));
+        ggml_backend_tensor_get(post_norm_c, post_norm_vals.data(), 0, post_norm_vals.size() * sizeof(float));
+        ggml_backend_tensor_get(hidden_c, hidden_vals.data(), 0, hidden_vals.size() * sizeof(float));
         ggml_backend_tensor_get(final_c, final_vals.data(), 0, final_vals.size() * sizeof(float));
-        float delta_sum = 0, ffn_mod_sum = 0, final_sum = 0;
+
+        // 첫 토큰의 첫 n_embd 값 sum
+        float delta_sum = 0, ffn_mod_sum = 0, post_norm_sum = 0, hidden_sum = 0, final_sum = 0;
         for (int i = 0; i < n_embd; i++) {
             delta_sum += std::abs(delta_vals[i]);
             ffn_mod_sum += std::abs(ffn_mod_vals[i]);
+            post_norm_sum += std::abs(post_norm_vals[i]);
+            hidden_sum += std::abs(hidden_vals[i]);
             final_sum += std::abs(final_vals[i]);
         }
-        fprintf(stderr, "[DEBUG INTER] delta[0:n_embd] sum=%.4f, ffn_mod sum=%.4f, final sum=%.4f\n",
-                delta_sum, ffn_mod_sum, final_sum);
+        fprintf(stderr, "\n[DEBUG INTER] 중간값 sum (token 0의 [0:n_embd]):\n");
+        fprintf(stderr, "  delta        = %.4f (LoRA 출력, 초기에 ~0이어야 함)\n", delta_sum);
+        fprintf(stderr, "  ffn_mod      = %.4f (ffn_out + delta)\n", ffn_mod_sum);
+        fprintf(stderr, "  post_norm    = %.4f (ffn_post_norm 적용 후)\n", post_norm_sum);
+        fprintf(stderr, "  hidden       = %.4f (sa_out + post_norm)\n", hidden_sum);
+        fprintf(stderr, "  final        = %.4f (result_norm 재계산)\n", final_sum);
+
+        // cap.data (캡처된 result_norm)와 비교
+        if (!cap_result_norm_c.empty()) {
+            // 첫 토큰
+            float cap_sum_first = 0, final_sum_first = 0;
+            for (int i = 0; i < n_embd && i < (int)cap_result_norm_c.size(); i++) {
+                cap_sum_first += std::abs(cap_result_norm_c[i]);
+                final_sum_first += std::abs(final_vals[i]);
+            }
+            // 마지막 토큰
+            int last_offset = (n_tokens_c - 1) * n_embd;
+            float cap_sum_last = 0, final_sum_last = 0;
+            for (int i = 0; i < n_embd && (last_offset + i) < (int)cap_result_norm_c.size(); i++) {
+                cap_sum_last += std::abs(cap_result_norm_c[last_offset + i]);
+                final_sum_last += std::abs(final_vals[last_offset + i]);
+            }
+            fprintf(stderr, "  [Token 0]  final=%.4f, cap=%.4f, diff=%.4f\n",
+                    final_sum_first, cap_sum_first, final_sum_first - cap_sum_first);
+            fprintf(stderr, "  [Token %d] final=%.4f, cap=%.4f, diff=%.4f\n",
+                    n_tokens_c - 1, final_sum_last, cap_sum_last, final_sum_last - cap_sum_last);
+
+            // 마지막 토큰의 첫 5개 값 비교
+            fprintf(stderr, "\n[DEBUG INTER] 마지막 토큰 값 비교 (처음 5개):\n");
+            for (int i = 0; i < 5 && (last_offset + i) < n_embd * n_tokens_c; i++) {
+                fprintf(stderr, "  [%d] final=%.6f, cap=%.6f, diff=%.6f\n",
+                        i, final_vals[last_offset + i], cap_result_norm_c[last_offset + i],
+                        final_vals[last_offset + i] - cap_result_norm_c[last_offset + i]);
+            }
+        }
+
+        // norm weights 확인
+        fprintf(stderr, "\n[DEBUG INTER] norm weights:\n");
+        float ffn_post_sum = 0, output_sum = 0;
+        for (int i = 0; i < n_embd; i++) {
+            ffn_post_sum += std::abs(storage.ffn_post_norm_weights[layer_idx][i]);
+            output_sum += std::abs(storage.output_norm_weights[i]);
+        }
+        fprintf(stderr, "  ffn_post_norm sum = %.4f\n", ffn_post_sum);
+        fprintf(stderr, "  output_norm sum   = %.4f\n", output_sum);
+        fprintf(stderr, "  ffn_post_norm[0:5] = %.4f, %.4f, %.4f, %.4f, %.4f\n",
+                storage.ffn_post_norm_weights[layer_idx][0],
+                storage.ffn_post_norm_weights[layer_idx][1],
+                storage.ffn_post_norm_weights[layer_idx][2],
+                storage.ffn_post_norm_weights[layer_idx][3],
+                storage.ffn_post_norm_weights[layer_idx][4]);
+        fprintf(stderr, "  output_norm[0:5]   = %.4f, %.4f, %.4f, %.4f, %.4f\n",
+                storage.output_norm_weights[0],
+                storage.output_norm_weights[1],
+                storage.output_norm_weights[2],
+                storage.output_norm_weights[3],
+                storage.output_norm_weights[4]);
+
+        // 핵심 비교: ffn_post_norm 출력 비교
+        if (!cap_ffn_post_norm_c.empty()) {
+            fprintf(stderr, "\n[DEBUG COMPARE] ffn_post_norm 출력 비교:\n");
+            float calc_sum = 0, cap_sum = 0;
+            for (int i = 0; i < n_embd && i < (int)cap_ffn_post_norm_c.size(); i++) {
+                calc_sum += std::abs(post_norm_vals[i]);
+                cap_sum += std::abs(cap_ffn_post_norm_c[i]);
+            }
+            fprintf(stderr, "  계산된 post_norm sum = %.4f\n", calc_sum);
+            fprintf(stderr, "  캡처된 ffn_post_norm sum = %.4f\n", cap_sum);
+            fprintf(stderr, "  비율: %.4f\n", calc_sum / (cap_sum + 1e-10f));
+
+            // 처음 5개 값 직접 비교
+            fprintf(stderr, "  값 비교 (처음 5개):\n");
+            for (int i = 0; i < 5 && i < (int)cap_ffn_post_norm_c.size(); i++) {
+                fprintf(stderr, "    [%d] calc=%.6f, cap=%.6f, diff=%.6f\n",
+                        i, post_norm_vals[i], cap_ffn_post_norm_c[i],
+                        post_norm_vals[i] - cap_ffn_post_norm_c[i]);
+            }
+        }
+
+        // 핵심 비교: l_out (hidden) 비교 - output_norm 전
+        if (!cap_l_out_c.empty()) {
+            fprintf(stderr, "\n[DEBUG COMPARE] l_out (hidden_c) 비교 - output_norm 전:\n");
+            float calc_sum = 0, cap_sum = 0;
+            for (int i = 0; i < n_embd && i < (int)cap_l_out_c.size(); i++) {
+                calc_sum += std::abs(hidden_vals[i]);
+                cap_sum += std::abs(cap_l_out_c[i]);
+            }
+            fprintf(stderr, "  계산된 hidden_c sum = %.4f\n", calc_sum);
+            fprintf(stderr, "  캡처된 l_out sum = %.4f\n", cap_sum);
+            fprintf(stderr, "  비율: %.4f\n", calc_sum / (cap_sum + 1e-10f));
+
+            // 처음 5개 값 직접 비교
+            fprintf(stderr, "  값 비교 (처음 5개):\n");
+            for (int i = 0; i < 5 && i < (int)cap_l_out_c.size(); i++) {
+                fprintf(stderr, "    [%d] calc=%.6f, cap=%.6f, diff=%.6f\n",
+                        i, hidden_vals[i], cap_l_out_c[i],
+                        hidden_vals[i] - cap_l_out_c[i]);
+            }
+        }
+
         debug_inter++;
     }
 
