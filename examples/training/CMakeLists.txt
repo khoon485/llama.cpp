@@ -52,3 +52,6 @@ target_include_directories(${TARGET} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
 target_compile_features(${TARGET} PRIVATE cxx_std_17)
+
+# Dense DPO (for Gemma 3 etc.)
+add_subdirectory(dense)

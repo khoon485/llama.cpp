@@ -3,11 +3,13 @@
 
 #include "llama.h"
 #include "llama-model.h"
+#include "llama-arch.h"
 #include "ggml.h"
 #include "ggml-backend.h"
 
 #include <vector>
 #include <cstdint>
+#include <string>
 
 namespace training {
 
@@ -16,6 +18,19 @@ inline struct ggml_tensor * find_lm_head(const llama_model * model) {
     if (model->output) return model->output;
     if (model->tok_embd) return model->tok_embd;
     return nullptr;
+}
+
+// Get lm_head tensor name for LoRA adapter
+inline std::string get_lm_head_name(const llama_model * model) {
+    struct ggml_tensor * lm_head = find_lm_head(model);
+    if (!lm_head || !lm_head->name) return "token_embd.weight";
+    return std::string(lm_head->name);
+}
+
+// Get model architecture string
+inline std::string get_model_arch(const llama_model * model) {
+    const char * arch_name = llm_arch_name(model->arch);
+    return arch_name ? std::string(arch_name) : "unknown";
 }
 
 // Load lm_head weights to float32 (dequantize if needed)

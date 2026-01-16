@@ -140,6 +140,12 @@ llama_adapter_lora_weight * llama_adapter_lora::get_weight(ggml_tensor * w) {
 
     const auto pos = ab_map.find(name);
     if (pos != ab_map.end()) {
+        // DEBUG: LoRA MATCHED!
+        static int match_count = 0;
+        if (match_count < 5) {
+            fprintf(stderr, "[DEBUG LoRA] *** MATCHED: '%s' ***\n", name.c_str());
+            match_count++;
+        }
         return &pos->second;
     }
 
