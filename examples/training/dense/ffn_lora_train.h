@@ -341,16 +341,9 @@ inline ffn_lora_step_result ffn_lora_dpo_step(
     // Forward pass
     // ============================================================================
 
-    // Step 1: LoRA delta = scale * B @ A @ ffn_geglu
-    // A @ ffn_geglu: [rank, n_ff] @ [n_ff, n_tokens] = [rank, n_tokens]
-    // B @ (A @ ffn_geglu): [n_embd, rank] @ [rank, n_tokens] = [n_embd, n_tokens]
-    struct ggml_tensor * a_in_c = ggml_mul_mat(ctx, t_lora_a, t_ffn_in_c);  // [rank, n_tokens_c]
-    struct ggml_tensor * delta_c = ggml_mul_mat(ctx, t_lora_b, a_in_c);     // [n_embd, n_tokens_c]
-    delta_c = ggml_scale(ctx, delta_c, scale);
-
-    struct ggml_tensor * a_in_r = ggml_mul_mat(ctx, t_lora_a, t_ffn_in_r);  // [rank, n_tokens_r]
-    struct ggml_tensor * delta_r = ggml_mul_mat(ctx, t_lora_b, a_in_r);     // [n_embd, n_tokens_r]
-    delta_r = ggml_scale(ctx, delta_r, scale);
+    // Step 1: LoRA delta = lora_matmul(ffn_in, A, B, scale) (fused)
+    struct ggml_tensor * delta_c = ggml_lora_matmul(ctx, t_ffn_in_c, t_lora_a, t_lora_b, scale);
+    struct ggml_tensor * delta_r = ggml_lora_matmul(ctx, t_ffn_in_r, t_lora_a, t_lora_b, scale);
 
     // Step 2: ffn_out' = ffn_out + delta
     struct ggml_tensor * ffn_out_mod_c = ggml_add(ctx, t_ffn_out_c, delta_c);
@@ -816,10 +809,8 @@ inline ffn_lora_step_result ffn_lora_sft_step(
     // Forward pass
     // ============================================================================
 
-    // Step 1: LoRA delta = scale * B @ A @ ffn_geglu
-    struct ggml_tensor * a_in = ggml_mul_mat(ctx, t_lora_a, t_ffn_in);
-    struct ggml_tensor * delta = ggml_mul_mat(ctx, t_lora_b, a_in);
-    delta = ggml_scale(ctx, delta, scale);
+    // Step 1: LoRA delta = lora_matmul(ffn_in, A, B, scale) (fused)
+    struct ggml_tensor * delta = ggml_lora_matmul(ctx, t_ffn_in, t_lora_a, t_lora_b, scale);
 
     // Step 2: ffn_out' = ffn_out + delta
     struct ggml_tensor * ffn_out_mod = ggml_add(ctx, t_ffn_out, delta);

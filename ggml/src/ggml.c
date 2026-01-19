@@ -1044,13 +1044,14 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "CROSS_ENTROPY_LOSS",
     "CROSS_ENTROPY_LOSS_BACK",
     "DPO_LOSS",
+    "LORA_MATMUL",
     "OPT_STEP_ADAMW",
     "OPT_STEP_SGD",
 
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 98, "GGML_OP_COUNT != 98");
+static_assert(GGML_OP_COUNT == 99, "GGML_OP_COUNT != 99");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1156,13 +1157,14 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "cross_entropy_loss(x,y)",
     "cross_entropy_loss_back(x,y)",
     "dpo_loss(lpc,lpr,rc,rr)",
+    "lora_matmul(x,A,B,s)",
     "adamw(x)",
     "sgd(x)",
 
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 98, "GGML_OP_COUNT != 98");
+static_assert(GGML_OP_COUNT == 99, "GGML_OP_COUNT != 99");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6092,6 +6094,37 @@ struct ggml_tensor * ggml_dpo_loss(
     return result;
 }
 
+// ggml_lora_matmul: scale * B @ A @ x
+// x: [in_dim, n_tokens], A: [in_dim, rank], B: [rank, out_dim]
+// result: [out_dim, n_tokens]
+
+struct ggml_tensor * ggml_lora_matmul(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b,
+        float                 scale) {
+    // x: [in_dim, n_tokens]
+    // A: [in_dim, rank] - matmul convention: A @ x = [rank, n_tokens]
+    // B: [rank, out_dim] - matmul convention: B @ (A @ x) = [out_dim, n_tokens]
+    GGML_ASSERT(x->ne[0] == a->ne[0]);  // in_dim
+    GGML_ASSERT(a->ne[1] == b->ne[0]);  // rank
+
+    int64_t out_dim = b->ne[1];
+    int64_t n_tokens = x->ne[1];
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, x->type, out_dim, n_tokens);
+
+    result->op     = GGML_OP_LORA_MATMUL;
+    result->src[0] = x;
+    result->src[1] = a;
+    result->src[2] = b;
+
+    ggml_set_op_params_f32(result, 0, scale);
+
+    return result;
+}
+
 // opt_step_adamw
 
 struct ggml_tensor * ggml_opt_step_adamw(
@@ -6806,6 +6839,52 @@ static void ggml_compute_backward(
                 default: {
                     GGML_ABORT("unsupported glu op for backward pass: %s", ggml_glu_op_name(ggml_get_glu_op(tensor)));
                 } //break;
+            }
+        } break;
+        case GGML_OP_LORA_MATMUL: {
+            // LoRA matmul: result = scale * B @ A @ x
+            // src0 = x [in_dim, n_tokens]
+            // src1 = A [in_dim, rank]
+            // src2 = B [rank, out_dim]
+            //
+            // Forward:
+            //   tmp = mul_mat(A, x) = A^T @ x  [rank, n_tokens]
+            //   out = mul_mat(B, tmp) = B^T @ tmp  [out_dim, n_tokens]
+            //   result = scale * out
+            //
+            // Backward:
+            //   d_out = scale * grad
+            //   d_B = out_prod(tmp, d_out)
+            //   d_tmp = out_prod(B, transpose(d_out))
+            //   d_A = out_prod(x, d_tmp)
+            //   d_x = out_prod(A, transpose(d_tmp))
+            const float scale = ggml_get_op_params_f32(tensor, 0);
+
+            // recompute intermediate
+            struct ggml_tensor * tmp = ggml_mul_mat(ctx, src1, src0);  // A^T @ x [rank, n_tokens]
+
+            // d_out = scale * grad
+            struct ggml_tensor * d_out = ggml_scale(ctx, grad, scale);
+
+            if (src2_needs_grads) {
+                // d_B = out_prod(tmp, d_out)
+                struct ggml_tensor * d_B = ggml_out_prod(ctx, tmp, d_out);
+                ggml_add_or_set(ctx, cgraph, isrc2, d_B);
+            }
+
+            // d_tmp = out_prod(B, transpose(d_out))
+            struct ggml_tensor * d_tmp = ggml_out_prod(ctx, src2, ggml_transpose(ctx, d_out));
+
+            if (src1_needs_grads) {
+                // d_A = out_prod(x, d_tmp)
+                struct ggml_tensor * d_A = ggml_out_prod(ctx, src0, d_tmp);
+                ggml_add_or_set(ctx, cgraph, isrc1, d_A);
+            }
+
+            if (src0_needs_grads) {
+                // d_x = out_prod(A, transpose(d_tmp))
+                struct ggml_tensor * d_x = ggml_out_prod(ctx, src1, ggml_transpose(ctx, d_tmp));
+                ggml_add_or_set(ctx, cgraph, isrc0, d_x);
             }
         } break;
         case GGML_OP_DPO_LOSS: {

@@ -10391,6 +10391,98 @@ void ggml_compute_forward_dpo_loss(
     }
 }
 
+// ggml_compute_forward_lora_matmul
+// result = scale * B @ A @ x
+// x: [in_dim, n_tokens], A: [in_dim, rank], B: [rank, out_dim]
+// result: [out_dim, n_tokens]
+
+static void ggml_compute_forward_lora_matmul_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * x = dst->src[0];  // [in_dim, n_tokens]
+    const ggml_tensor * a = dst->src[1];  // [in_dim, rank]
+    const ggml_tensor * b = dst->src[2];  // [rank, out_dim]
+
+    GGML_ASSERT(x->type == GGML_TYPE_F32);
+    GGML_ASSERT(a->type == GGML_TYPE_F32);
+    GGML_ASSERT(b->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+
+    const int64_t in_dim   = x->ne[0];
+    const int64_t n_tokens = x->ne[1];
+    const int64_t rank     = a->ne[1];
+    const int64_t out_dim  = b->ne[1];
+
+    GGML_ASSERT(a->ne[0] == in_dim);
+    GGML_ASSERT(b->ne[0] == rank);
+    GGML_ASSERT(dst->ne[0] == out_dim);
+    GGML_ASSERT(dst->ne[1] == n_tokens);
+
+    const float scale = ggml_get_op_params_f32(dst, 0);
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    // Parallelize over tokens
+    const int64_t dr = (n_tokens + nth - 1) / nth;
+    const int64_t ir0 = dr * ith;
+    const int64_t ir1 = ir0 + dr < n_tokens ? ir0 + dr : n_tokens;
+
+    const float * x_data = (const float *) x->data;
+    const float * a_data = (const float *) a->data;
+    const float * b_data = (const float *) b->data;
+    float * dst_data = (float *) dst->data;
+
+    // Temporary storage for A @ x (one token at a time)
+    // tmp[r] = sum_i A[i, r] * x[i, t]
+    float * tmp = (float *) alloca(rank * sizeof(float));
+
+    for (int64_t t = ir0; t < ir1; t++) {
+        // Step 1: tmp = A @ x[:, t]
+        // tmp[r] = sum_i A[i, r] * x[i, t]
+        for (int64_t r = 0; r < rank; r++) {
+            float sum = 0.0f;
+            for (int64_t i = 0; i < in_dim; i++) {
+                // A is [in_dim, rank], so A[i, r] is at a_data[i + r * in_dim]
+                // x is [in_dim, n_tokens], so x[i, t] is at x_data[i + t * in_dim]
+                sum += a_data[i + r * in_dim] * x_data[i + t * in_dim];
+            }
+            tmp[r] = sum;
+        }
+
+        // Step 2: result = scale * B @ tmp
+        // result[o, t] = scale * sum_r B[r, o] * tmp[r]
+        for (int64_t o = 0; o < out_dim; o++) {
+            float sum = 0.0f;
+            for (int64_t r = 0; r < rank; r++) {
+                // B is [rank, out_dim], so B[r, o] is at b_data[r + o * rank]
+                sum += b_data[r + o * rank] * tmp[r];
+            }
+            // dst is [out_dim, n_tokens], so dst[o, t] is at dst_data[o + t * out_dim]
+            dst_data[o + t * out_dim] = scale * sum;
+        }
+    }
+}
+
+void ggml_compute_forward_lora_matmul(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * src0 = dst->src[0];
+
+    switch (src0->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_lora_matmul_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
 static void ggml_compute_forward_opt_step_adamw_f32(
         const ggml_compute_params * params,
         ggml_tensor * dst) {

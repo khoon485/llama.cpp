@@ -570,6 +570,7 @@ extern "C" {
         GGML_OP_CROSS_ENTROPY_LOSS,
         GGML_OP_CROSS_ENTROPY_LOSS_BACK,
         GGML_OP_DPO_LOSS,
+        GGML_OP_LORA_MATMUL,
         GGML_OP_OPT_STEP_ADAMW,
         GGML_OP_OPT_STEP_SGD,
 
@@ -2590,6 +2591,17 @@ extern "C" {
             struct ggml_tensor  * ref_c,    // reference chosen log probability
             struct ggml_tensor  * ref_r,    // reference rejected log probability
             float                 beta);    // temperature parameter
+
+    // LoRA matmul: scale * B @ A @ x
+    // Fused operation for efficient LoRA forward pass
+    // x: [in_dim, n_tokens], A: [in_dim, rank], B: [rank, out_dim]
+    // result: [out_dim, n_tokens]
+    GGML_API struct ggml_tensor * ggml_lora_matmul(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,      // input tensor
+            struct ggml_tensor  * a,      // LoRA A matrix
+            struct ggml_tensor  * b,      // LoRA B matrix
+            float                 scale); // alpha/rank
 
     // AdamW optimizer step
     // Paper: https://arxiv.org/pdf/1711.05101v3.pdf

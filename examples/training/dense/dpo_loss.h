@@ -191,19 +191,15 @@ inline dpo_step_result dpo_training_step(
     ggml_set_param(t_lora_a);
     ggml_set_param(t_lora_b);
 
-    // Forward: LoRA + DPO Loss
-    // Chosen path: out = frozen + (alpha/rank) * B @ A @ frozen
-    struct ggml_tensor * ax_c = ggml_mul_mat(ctx, t_lora_a, t_frozen_c);
-    struct ggml_tensor * bax_c = ggml_mul_mat(ctx, t_lora_b, ax_c);
-    struct ggml_tensor * scaled_bax_c = ggml_scale(ctx, bax_c, lora_scale);
-    struct ggml_tensor * out_c = ggml_add(ctx, t_frozen_c, scaled_bax_c);
+    // Forward: LoRA + DPO Loss (fused lora matmul: scale * B @ A @ x)
+    // Chosen path: out = frozen + lora_matmul(frozen, A, B, scale)
+    struct ggml_tensor * lora_out_c = ggml_lora_matmul(ctx, t_frozen_c, t_lora_a, t_lora_b, lora_scale);
+    struct ggml_tensor * out_c = ggml_add(ctx, t_frozen_c, lora_out_c);
     struct ggml_tensor * logits_c = ggml_mul_mat(ctx, t_lm_head, out_c);
 
     // Rejected path
-    struct ggml_tensor * ax_r = ggml_mul_mat(ctx, t_lora_a, t_frozen_r);
-    struct ggml_tensor * bax_r = ggml_mul_mat(ctx, t_lora_b, ax_r);
-    struct ggml_tensor * scaled_bax_r = ggml_scale(ctx, bax_r, lora_scale);
-    struct ggml_tensor * out_r = ggml_add(ctx, t_frozen_r, scaled_bax_r);
+    struct ggml_tensor * lora_out_r = ggml_lora_matmul(ctx, t_frozen_r, t_lora_a, t_lora_b, lora_scale);
+    struct ggml_tensor * out_r = ggml_add(ctx, t_frozen_r, lora_out_r);
     struct ggml_tensor * logits_r = ggml_mul_mat(ctx, t_lm_head, out_r);
 
     // Log-probs using cross_entropy (numerically stable, returns avg per token)

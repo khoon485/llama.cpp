@@ -89,11 +89,9 @@ inline ce_step_result ce_training_step(
     ggml_set_param(t_lora_a);
     ggml_set_param(t_lora_b);
 
-    // Forward: out = frozen + (alpha/rank) * B @ A @ frozen
-    struct ggml_tensor * ax = ggml_mul_mat(ctx, t_lora_a, t_frozen);
-    struct ggml_tensor * bax = ggml_mul_mat(ctx, t_lora_b, ax);
-    struct ggml_tensor * scaled_bax = ggml_scale(ctx, bax, lora_scale);
-    struct ggml_tensor * out = ggml_add(ctx, t_frozen, scaled_bax);
+    // Forward: out = frozen + lora_matmul(frozen, A, B, scale) (fused lora)
+    struct ggml_tensor * lora_out = ggml_lora_matmul(ctx, t_frozen, t_lora_a, t_lora_b, lora_scale);
+    struct ggml_tensor * out = ggml_add(ctx, t_frozen, lora_out);
     struct ggml_tensor * logits = ggml_mul_mat(ctx, t_lm_head, out);
 
     // CE Loss: -mean(log_softmax(logits) * targets)
