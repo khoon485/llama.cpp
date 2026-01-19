@@ -221,12 +221,7 @@ inline dpo_step_result dpo_training_step(
     ggml_set_input(t_ref_r);
 
     // Full DPO loss: softplus(-β * [(log_p_c - ref_c) - (log_p_r - ref_r)])
-    struct ggml_tensor * chosen_imp = ggml_sub(ctx, log_p_c, t_ref_c);
-    struct ggml_tensor * rejected_imp = ggml_sub(ctx, log_p_r, t_ref_r);
-    struct ggml_tensor * diff = ggml_sub(ctx, chosen_imp, rejected_imp);
-    struct ggml_tensor * scaled = ggml_scale(ctx, diff, beta);
-    struct ggml_tensor * neg_scaled = ggml_neg(ctx, scaled);
-    struct ggml_tensor * loss = ggml_softplus(ctx, neg_scaled);
+    struct ggml_tensor * loss = ggml_dpo_loss(ctx, log_p_c, log_p_r, t_ref_c, t_ref_r, beta);
 
     ggml_set_name(log_p_c, "log_p_c");
     ggml_set_name(log_p_r, "log_p_r");

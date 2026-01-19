@@ -394,12 +394,8 @@ inline ffn_lora_step_result ffn_lora_dpo_step(
     struct ggml_tensor * log_p_r = ggml_neg(ctx, ce_r);
 
     // Step 8: DPO Loss = softplus(-beta * ((log_p_c - ref_c) - (log_p_r - ref_r)))
-    struct ggml_tensor * chosen_imp = ggml_sub(ctx, log_p_c, t_ref_c);
-    struct ggml_tensor * rejected_imp = ggml_sub(ctx, log_p_r, t_ref_r);
-    struct ggml_tensor * diff = ggml_sub(ctx, chosen_imp, rejected_imp);
-    struct ggml_tensor * scaled_diff = ggml_scale(ctx, diff, beta);
-    struct ggml_tensor * neg_scaled = ggml_neg(ctx, scaled_diff);
-    struct ggml_tensor * loss = ggml_softplus(ctx, neg_scaled);
+    // Fused kernel 버전 (6-op chain을 1-op로)
+    struct ggml_tensor * loss = ggml_dpo_loss(ctx, log_p_c, log_p_r, t_ref_c, t_ref_r, beta);
 
     // Mark outputs
     ggml_set_name(log_p_c, "log_p_c");

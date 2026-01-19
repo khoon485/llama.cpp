@@ -1043,13 +1043,14 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
 
     "CROSS_ENTROPY_LOSS",
     "CROSS_ENTROPY_LOSS_BACK",
+    "DPO_LOSS",
     "OPT_STEP_ADAMW",
     "OPT_STEP_SGD",
 
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 97");
+static_assert(GGML_OP_COUNT == 98, "GGML_OP_COUNT != 98");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1154,13 +1155,14 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
 
     "cross_entropy_loss(x,y)",
     "cross_entropy_loss_back(x,y)",
+    "dpo_loss(lpc,lpr,rc,rr)",
     "adamw(x)",
     "sgd(x)",
 
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 97");
+static_assert(GGML_OP_COUNT == 98, "GGML_OP_COUNT != 98");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6064,6 +6066,32 @@ struct ggml_tensor * ggml_cross_entropy_loss_back(
     return result;
 }
 
+// ggml_dpo_loss
+
+struct ggml_tensor * ggml_dpo_loss(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * log_p_c,
+        struct ggml_tensor  * log_p_r,
+        struct ggml_tensor  * ref_c,
+        struct ggml_tensor  * ref_r,
+        float                 beta) {
+    GGML_ASSERT(ggml_are_same_shape(log_p_c, log_p_r));
+    GGML_ASSERT(ggml_are_same_shape(log_p_c, ref_c));
+    GGML_ASSERT(ggml_are_same_shape(log_p_c, ref_r));
+
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, log_p_c->type, 1);
+
+    result->op     = GGML_OP_DPO_LOSS;
+    result->src[0] = log_p_c;
+    result->src[1] = log_p_r;
+    result->src[2] = ref_c;
+    result->src[3] = ref_r;
+
+    ggml_set_op_params_f32(result, 0, beta);
+
+    return result;
+}
+
 // opt_step_adamw
 
 struct ggml_tensor * ggml_opt_step_adamw(
@@ -6779,6 +6807,45 @@ static void ggml_compute_backward(
                     GGML_ABORT("unsupported glu op for backward pass: %s", ggml_glu_op_name(ggml_get_glu_op(tensor)));
                 } //break;
             }
+        } break;
+        case GGML_OP_DPO_LOSS: {
+            // DPO loss: softplus(-β × margin), margin = (log_p_c - ref_c) - (log_p_r - ref_r)
+            // d_loss/d_log_p_c = -β × sigmoid(-β × margin) × grad
+            // d_loss/d_log_p_r = +β × sigmoid(-β × margin) × grad
+            //
+            // 단순화: 6-op chain backward와 동일한 방식으로 구현
+            // softplus(x).backward = sigmoid(x) * grad
+            // x = -beta * margin = neg_scaled
+            const float beta = ggml_get_op_params_f32(tensor, 0);
+
+            // margin 계산 (forward에서 했던 것 재계산)
+            struct ggml_tensor * diff0 = ggml_sub(ctx, src0, src2);           // log_p_c - ref_c
+            struct ggml_tensor * diff1 = ggml_sub(ctx, src1, tensor->src[3]); // log_p_r - ref_r
+            struct ggml_tensor * margin = ggml_sub(ctx, diff0, diff1);
+            struct ggml_tensor * neg_scaled = ggml_scale(ctx, margin, -beta); // -beta * margin
+
+            // softplus backward: grad_neg_scaled = sigmoid(neg_scaled) * grad
+            struct ggml_tensor * grad_neg_scaled = ggml_mul(ctx, ggml_sigmoid(ctx, neg_scaled), grad);
+
+            // neg backward: grad_scaled = -grad_neg_scaled
+            struct ggml_tensor * grad_scaled = ggml_neg(ctx, grad_neg_scaled);
+
+            // scale backward: grad_margin = beta * grad_scaled
+            struct ggml_tensor * grad_margin = ggml_scale(ctx, grad_scaled, beta);
+
+            // sub backward (margin = diff0 - diff1): grad_diff0 = grad_margin, grad_diff1 = -grad_margin
+            struct ggml_tensor * grad_diff0 = grad_margin;
+            struct ggml_tensor * grad_diff1 = ggml_neg(ctx, grad_margin);
+
+            // sub backward (diff0 = src0 - src2): grad_src0 = grad_diff0
+            // sub backward (diff1 = src1 - src3): grad_src1 = grad_diff1
+            if (src0_needs_grads) {
+                ggml_add_or_set(ctx, cgraph, isrc0, grad_diff0);
+            }
+            if (src1_needs_grads) {
+                ggml_add_or_set(ctx, cgraph, isrc1, grad_diff1);
+            }
+            // ref_c (src2) and ref_r (src3) are constants, no gradient needed
         } break;
         case GGML_OP_NONE: {
             // noop

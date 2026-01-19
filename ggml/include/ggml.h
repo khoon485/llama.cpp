@@ -569,6 +569,7 @@ extern "C" {
 
         GGML_OP_CROSS_ENTROPY_LOSS,
         GGML_OP_CROSS_ENTROPY_LOSS_BACK,
+        GGML_OP_DPO_LOSS,
         GGML_OP_OPT_STEP_ADAMW,
         GGML_OP_OPT_STEP_SGD,
 
@@ -2580,6 +2581,15 @@ extern "C" {
             struct ggml_tensor  * a,  // logits
             struct ggml_tensor  * b,  // labels
             struct ggml_tensor  * c); // gradients of cross_entropy_loss result
+
+    // DPO loss: softplus(-beta * ((log_p_c - ref_c) - (log_p_r - ref_r)))
+    GGML_API struct ggml_tensor * ggml_dpo_loss(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * log_p_c,  // chosen log probability
+            struct ggml_tensor  * log_p_r,  // rejected log probability
+            struct ggml_tensor  * ref_c,    // reference chosen log probability
+            struct ggml_tensor  * ref_r,    // reference rejected log probability
+            float                 beta);    // temperature parameter
 
     // AdamW optimizer step
     // Paper: https://arxiv.org/pdf/1711.05101v3.pdf

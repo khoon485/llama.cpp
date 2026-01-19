@@ -10327,6 +10327,70 @@ void ggml_compute_forward_cross_entropy_loss_back(
     }
 }
 
+// ggml_compute_forward_dpo_loss
+// DPO loss: softplus(-beta * ((log_p_c - ref_c) - (log_p_r - ref_r)))
+
+static void ggml_compute_forward_dpo_loss_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * log_p_c = dst->src[0];
+    const ggml_tensor * log_p_r = dst->src[1];
+    const ggml_tensor * ref_c   = dst->src[2];
+    const ggml_tensor * ref_r   = dst->src[3];
+
+    GGML_ASSERT(log_p_c->type == GGML_TYPE_F32);
+    GGML_ASSERT(log_p_r->type == GGML_TYPE_F32);
+    GGML_ASSERT(ref_c->type == GGML_TYPE_F32);
+    GGML_ASSERT(ref_r->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_scalar(dst));
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+
+    // Only thread 0 computes the result (scalar output)
+    if (params->ith != 0) {
+        return;
+    }
+
+    const float beta = ggml_get_op_params_f32(dst, 0);
+
+    const int64_t ne = ggml_nelements(log_p_c);
+    float sum = 0.0f;
+
+    for (int64_t i = 0; i < ne; i++) {
+        const float lpc = ((const float *) log_p_c->data)[i];
+        const float lpr = ((const float *) log_p_r->data)[i];
+        const float rc  = ((const float *) ref_c->data)[i];
+        const float rr  = ((const float *) ref_r->data)[i];
+
+        // margin = (log_p_c - ref_c) - (log_p_r - ref_r)
+        const float margin = (lpc - rc) - (lpr - rr);
+
+        // softplus(-beta * margin) = log(1 + exp(-beta * margin))
+        sum += log1pf(expf(-beta * margin));
+    }
+
+    // Average over batch
+    ((float *) dst->data)[0] = sum / (float) ne;
+}
+
+void ggml_compute_forward_dpo_loss(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * src0 = dst->src[0];
+
+    switch (src0->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_dpo_loss_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
 static void ggml_compute_forward_opt_step_adamw_f32(
         const ggml_compute_params * params,
         ggml_tensor * dst) {

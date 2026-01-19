@@ -55,3 +55,10 @@ target_compile_features(${TARGET} PRIVATE cxx_std_17)
 
 # Dense DPO (for Gemma 3 etc.)
 add_subdirectory(dense)
+
+# Tests
+set(TARGET test-dpo-loss-fusion)
+add_executable(${TARGET} tests/test-dpo-loss-fusion.cpp)
+target_link_libraries(${TARGET} PRIVATE ggml ${CMAKE_THREAD_LIBS_INIT})
+target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/include)
+target_compile_features(${TARGET} PRIVATE cxx_std_17)

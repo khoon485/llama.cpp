@@ -219,6 +219,7 @@ inline dpo_step_result dpo_training_step(
     ggml_set_input(t_ref_r);
 
     // Full DPO loss: softplus(-β * [(log_p_c - ref_c) - (log_p_r - ref_r)])
+    // 6-op chain (잘 동작하던 버전)
     struct ggml_tensor * chosen_imp = ggml_sub(ctx, log_p_c, t_ref_c);
     struct ggml_tensor * rejected_imp = ggml_sub(ctx, log_p_r, t_ref_r);
     struct ggml_tensor * diff = ggml_sub(ctx, chosen_imp, rejected_imp);
