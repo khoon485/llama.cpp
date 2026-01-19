@@ -112,7 +112,10 @@ struct dpo_config {
             if (j.contains("rank")) rank = j["rank"];
             if (j.contains("alpha")) alpha = j["alpha"];
             return true;
-        } catch (...) { return false; }
+        } catch (const std::exception & e) {
+            LOG_ERR("Config parse error: %s\n", e.what());
+            return false;
+        }
     }
 };
 
@@ -157,16 +160,6 @@ int main(int argc, char ** argv) {
         else { filtered_argv.push_back(argv[i]); }
     }
 
-    // Env fallback
-    const char * env;
-    if ((env = std::getenv("EPOCHS"))) cfg.n_epochs = std::atoi(env);
-    if ((env = std::getenv("DPO_BETA"))) cfg.dpo_beta = std::stof(env);
-    if ((env = std::getenv("LR"))) cfg.lr = std::stof(env);
-    if ((env = std::getenv("RANK"))) cfg.rank = std::atoi(env);
-    if ((env = std::getenv("ALPHA"))) cfg.alpha = std::stof(env);
-    if ((env = std::getenv("OUTPUT"))) cfg.output_path = env;
-    if ((env = std::getenv("LORA_IN"))) cfg.lora_in_path = env;
-
     int n_epochs = cfg.n_epochs;
     float dpo_beta = cfg.dpo_beta;
     float lr = cfg.lr;
@@ -190,12 +183,11 @@ int main(int argc, char ** argv) {
 
     // DPO file
     std::string dpo_file = cfg.dpo_file;
-    if (dpo_file.empty()) {
-        if ((env = std::getenv("DPO_FILE"))) dpo_file = env;
-        else if (!params.prompt_file.empty()) dpo_file = params.prompt_file;
+    if (dpo_file.empty() && !params.prompt_file.empty()) {
+        dpo_file = params.prompt_file;
     }
     if (dpo_file.empty()) {
-        LOG_ERR("DPO file required: use --config, -f, or DPO_FILE=<path>\n");
+        LOG_ERR("DPO file required: use --config or -f\n");
         return 1;
     }
 
@@ -312,17 +304,14 @@ int main(int argc, char ** argv) {
     srand(42);
     init_ffn_lora_storage(storage, lora_cfg);
 
-    // Load norm weights from model (마지막 레이어만 학습)
+    // Load existing LoRA if provided, otherwise use last layer
     int target_layer = n_layers - 1;
-    load_norm_weights_from_model(storage, model, target_layer);
-
-    // Load existing LoRA if provided
     if (!lora_in_path.empty()) {
-        if (!load_ffn_lora_gguf(storage, lora_in_path.c_str())) {
-            LOG_ERR("Failed to load LoRA from %s\n", lora_in_path.c_str());
-            return 1;
-        }
+        target_layer = load_ffn_lora_gguf(storage, lora_in_path.c_str());
     }
+
+    // Load norm weights for the target layer
+    load_norm_weights_from_model(storage, model, target_layer);
 
     // Training backend
     ggml_backend_t train_backend = ggml_backend_cuda_init(0);
@@ -465,25 +454,6 @@ int main(int argc, char ** argv) {
                 if (next >= 0 && next < n_vocab) targets_r[next + t * n_vocab] = 1.0f;
             }
 
-            // DEBUG: 캡처된 값 비교
-            static int debug_cap = 0;
-            if (debug_cap < 1) {
-                float ref_ce = compute_ref_logp(train_backend, cap_c.data, lm_head_f32, targets_c, n_embd, n_vocab, n_tokens_c);
-                fprintf(stderr, "\n[DEBUG CAP] ref_logp from cap.data = %.4f (should match ref_logp_c[%zu]=%.4f)\n",
-                        ref_ce, i, ref_logp_c[i]);
-                fprintf(stderr, "[DEBUG CAP] n_tokens_c=%d, ffn_input.size=%zu, ffn_output.size=%zu\n",
-                        n_tokens_c, cap_c.ffn_input.size(), cap_c.ffn_output.size());
-                fprintf(stderr, "[DEBUG CAP] target_layer=%d, ffn_post_norm_layer=%d, l_out_layer=%d\n",
-                        cap_c.target_layer, cap_c.ffn_post_norm_layer, cap_c.l_out_layer);
-                // cap.data (result_norm) sum
-                float cap_data_sum = 0;
-                for (int k = 0; k < n_embd && k < (int)cap_c.data.size(); k++) {
-                    cap_data_sum += std::abs(cap_c.data[k]);
-                }
-                fprintf(stderr, "[DEBUG CAP] cap.data (result_norm) sum[0:n_embd] = %.4f\n", cap_data_sum);
-                debug_cap++;
-            }
-
             // Training step
             ffn_lora_step_result res = ffn_lora_dpo_step(
                 train_backend,
@@ -502,10 +472,7 @@ int main(int argc, char ** argv) {
                 ref_logp_c[i],
                 ref_logp_r[i],
                 target_layer,
-                true,  // compute gradients
-                cap_c.data,  // 디버그용: 캡처된 result_norm
-                cap_c.ffn_post_norm_out,  // 디버그용: 캡처된 ffn_post_norm
-                cap_c.l_out  // 디버그용: 캡처된 l_out (output_norm 전)
+                true  // compute gradients
             );
 
             if (std::isnan(res.loss) || std::isinf(res.loss)) {
@@ -515,17 +482,6 @@ int main(int argc, char ** argv) {
 
             // Apply gradients
             apply_ffn_lora_gradients(storage, res, target_layer, lr);
-
-            // DEBUG: 실제 log_p 값 출력
-            static int debug_logp = 0;
-            if (debug_logp < 3) {
-                fprintf(stderr, "\n[DEBUG LOGP %d] log_p_c=%.4f, log_p_r=%.4f, ref_c=%.4f, ref_r=%.4f\n",
-                        debug_logp, res.log_p_c, res.log_p_r, ref_logp_c[i], ref_logp_r[i]);
-                fprintf(stderr, "[DEBUG LOGP %d] margin = (%.4f - %.4f) - (%.4f - %.4f) = %.4f\n",
-                        debug_logp, res.log_p_c, ref_logp_c[i], res.log_p_r, ref_logp_r[i],
-                        (res.log_p_c - ref_logp_c[i]) - (res.log_p_r - ref_logp_r[i]));
-                debug_logp++;
-            }
             epoch_metrics.update(res.log_p_c, res.log_p_r, ref_logp_c[i], ref_logp_r[i], res.loss);
 
             auto now = std::chrono::steady_clock::now();

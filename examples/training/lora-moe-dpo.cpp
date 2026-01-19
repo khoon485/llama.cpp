@@ -199,7 +199,10 @@ struct dpo_config {
             if (j.contains("rank")) rank = j["rank"];
             if (j.contains("alpha")) alpha = j["alpha"];
             return true;
-        } catch (...) { return false; }
+        } catch (const std::exception & e) {
+            LOG_ERR("Config parse error: %s\n", e.what());
+            return false;
+        }
     }
 };
 

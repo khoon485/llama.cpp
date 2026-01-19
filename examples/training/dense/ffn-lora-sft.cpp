@@ -1,7 +1,6 @@
 // ffn-lora-sft.cpp - FFN Down LoRA SFT Trainer
 //
 // FFN down에 LoRA 적용, Cross-entropy loss로 직접 지식 학습
-// DPO 코드 기반, rejected 없이 chosen만 사용
 //
 // Usage:
 //   ./llama-ffn-lora-sft --config train.json
@@ -66,7 +65,7 @@ static std::vector<sft_sample> load_sft_data(const std::string & path) {
             json j = json::parse(line);
             sft_sample sample;
             sample.prompt = j.value("prompt", "");
-            // SFT: "completion" 또는 "chosen" 필드 사용
+            // SFT: "completion" or "chosen"
             sample.completion = j.value("completion", j.value("chosen", ""));
             if (!sample.prompt.empty() && !sample.completion.empty()) {
                 data.push_back(sample);
@@ -110,7 +109,10 @@ struct sft_config {
             if (j.contains("alpha")) alpha = j["alpha"];
             if (j.contains("val_split")) val_split = j["val_split"];
             return true;
-        } catch (...) { return false; }
+        } catch (const std::exception & e) {
+            LOG_ERR("Config parse error: %s\n", e.what());
+            return false;
+        }
     }
 };
 
@@ -240,16 +242,6 @@ int main(int argc, char ** argv) {
         else { filtered_argv.push_back(argv[i]); }
     }
 
-    // Env fallback
-    const char * env;
-    if ((env = std::getenv("EPOCHS"))) cfg.n_epochs = std::atoi(env);
-    if ((env = std::getenv("LR"))) cfg.lr = std::stof(env);
-    if ((env = std::getenv("RANK"))) cfg.rank = std::atoi(env);
-    if ((env = std::getenv("ALPHA"))) cfg.alpha = std::stof(env);
-    if ((env = std::getenv("OUTPUT"))) cfg.output_path = env;
-    if ((env = std::getenv("LORA_IN"))) cfg.lora_in_path = env;
-    if ((env = std::getenv("VAL_SPLIT"))) cfg.val_split = std::stof(env);
-
     int n_epochs = cfg.n_epochs;
     float lr = cfg.lr;
     int rank = cfg.rank;
@@ -273,13 +265,11 @@ int main(int argc, char ** argv) {
 
     // Data file
     std::string data_file = cfg.data_file;
-    if (data_file.empty()) {
-        if ((env = std::getenv("DATA_FILE"))) data_file = env;
-        else if ((env = std::getenv("DPO_FILE"))) data_file = env;
-        else if (!params.prompt_file.empty()) data_file = params.prompt_file;
+    if (data_file.empty() && !params.prompt_file.empty()) {
+        data_file = params.prompt_file;
     }
     if (data_file.empty()) {
-        LOG_ERR("Data file required: use --config, -f, or DATA_FILE=<path>\n");
+        LOG_ERR("Data file required: use --config or -f\n");
         return 1;
     }
 
@@ -325,7 +315,7 @@ int main(int argc, char ** argv) {
     }
 
     // Shuffle and split train/val
-    std::mt19937 rng(42);
+    std::mt19937 rng(42); //Random seed
     std::shuffle(all_data.begin(), all_data.end(), rng);
 
     std::vector<sft_sample> train_data;
@@ -333,8 +323,8 @@ int main(int argc, char ** argv) {
 
     if (val_split > 0.0f && val_split < 1.0f) {
         size_t val_size = (size_t)(all_data.size() * val_split);
-        if (val_size < 1) val_size = 1;  // 최소 1개
-        if (val_size >= all_data.size()) val_size = all_data.size() - 1;  // 최소 train 1개
+        if (val_size < 1) val_size = 1; 
+        if (val_size >= all_data.size()) val_size = all_data.size() - 1;
 
         val_data.assign(all_data.begin(), all_data.begin() + val_size);
         train_data.assign(all_data.begin() + val_size, all_data.end());
@@ -346,7 +336,8 @@ int main(int argc, char ** argv) {
         LOG_INF("No validation split (val_split=%.2f)\n", val_split);
     }
 
-    // Calculate context
+    // Estimate context size from data to minimize skipped samples
+    // ~3 bytes per token (works for both ASCII and UTF-8), +64 padding, aligned to 256
     int max_chars = 0;
     for (const auto & sample : all_data) {
         int len = (int)(sample.prompt.size() + sample.completion.size());
@@ -417,19 +408,16 @@ int main(int argc, char ** argv) {
     srand(42);
     init_ffn_lora_storage(storage, lora_cfg);
 
-    // Load norm weights from model (마지막 레이어만 학습)
+    // Load existing LoRA if provided, otherwise use last layer
     int target_layer = n_layers - 1;
-    load_norm_weights_from_model(storage, model, target_layer);
-
-    // Load existing LoRA if provided
     if (!lora_in_path.empty()) {
-        if (!load_ffn_lora_gguf(storage, lora_in_path.c_str())) {
-            LOG_ERR("Failed to load LoRA from %s\n", lora_in_path.c_str());
-            return 1;
-        }
+        target_layer = load_ffn_lora_gguf(storage, lora_in_path.c_str());
     }
 
-    // Training backend
+    // Load norm weights for the target layer
+    load_norm_weights_from_model(storage, model, target_layer);
+
+    // Training backend (CUDA if available)
     ggml_backend_t train_backend = ggml_backend_cuda_init(0);
     if (!train_backend) {
         LOG_INF("CUDA not available, using CPU\n");
@@ -458,7 +446,6 @@ int main(int argc, char ** argv) {
         std::shuffle(indices.begin(), indices.end(), rng);
 
         float epoch_loss = 0.0f;
-        float epoch_log_p = 0.0f;
         int n_samples = 0;
 
         auto epoch_start = std::chrono::steady_clock::now();
@@ -497,11 +484,11 @@ int main(int argc, char ** argv) {
                 }
             }
 
-            // SFT step: CE loss 직접 사용
+            // SFT step: CE loss
             ffn_lora_step_result res = ffn_lora_sft_step(
                 train_backend,
                 storage,
-                cap.ffn_input,   // ffn_geglu
+                cap.ffn_input,   // FFN activation (geglu/swiglu/silu depending on model)
                 cap.ffn_output,  // ffn_out
                 cap.sa_out,      // sa_out
                 lm_head_f32,
@@ -516,14 +503,12 @@ int main(int argc, char ** argv) {
                 continue;
             }
 
-            // SFT loss = CE (res.loss가 이미 CE)
+            // Shared struct with DPO - zeroed DPO fields make it mathematically equivalent to CE
             float ce_loss = res.loss;
 
-            // Apply gradients
             apply_ffn_lora_gradients(storage, res, target_layer, lr);
 
             epoch_loss += ce_loss;
-            epoch_log_p += res.log_p_c;
             n_samples++;
 
             // Progress
@@ -553,7 +538,6 @@ int main(int argc, char ** argv) {
         }
 
         float avg_train_loss = epoch_loss / n_samples;
-        float avg_log_p = epoch_log_p / n_samples;
 
         // Validation
         float avg_val_loss = 0.0f;

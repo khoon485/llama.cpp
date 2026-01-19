@@ -23,7 +23,7 @@ inline struct ggml_tensor * find_lm_head(const llama_model * model) {
 // Get lm_head tensor name for LoRA adapter
 inline std::string get_lm_head_name(const llama_model * model) {
     struct ggml_tensor * lm_head = find_lm_head(model);
-    if (!lm_head || !lm_head->name) return "token_embd.weight";
+    if (!lm_head) return "token_embd.weight";
     return std::string(lm_head->name);
 }
 

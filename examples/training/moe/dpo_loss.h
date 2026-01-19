@@ -108,9 +108,10 @@ inline float compute_ref_logp(
     ggml_set_input(t_targets);
 
     struct ggml_tensor * logits = ggml_mul_mat(ctx, t_lm_head, t_hidden);
-    struct ggml_tensor * log_probs = ggml_log(ctx, ggml_soft_max(ctx, logits));
-    struct ggml_tensor * sum_log_p = ggml_sum(ctx, ggml_mul(ctx, log_probs, t_targets));
-    struct ggml_tensor * log_p = ggml_scale(ctx, sum_log_p, 1.0f / n_tokens);
+    // 수치 안정성: cross_entropy_loss 사용 (Dense와 일치)
+    // log_p = -avg_ce (avg CE per token)
+    struct ggml_tensor * avg_ce = ggml_cross_entropy_loss(ctx, logits, t_targets);
+    struct ggml_tensor * log_p = ggml_neg(ctx, avg_ce);
     ggml_set_output(log_p);
 
     struct ggml_cgraph * gf = ggml_new_graph(ctx);
@@ -206,13 +207,12 @@ inline dpo_step_result dpo_training_step(
     struct ggml_tensor * out_r = ggml_add(ctx, t_frozen_r, scaled_bax_r);
     struct ggml_tensor * logits_r = ggml_mul_mat(ctx, t_lm_head, out_r);
 
-    // Log-probs (normalized by token count)
-    struct ggml_tensor * log_probs_c = ggml_log(ctx, ggml_soft_max(ctx, logits_c));
-    struct ggml_tensor * log_probs_r = ggml_log(ctx, ggml_soft_max(ctx, logits_r));
-    struct ggml_tensor * sum_log_p_c = ggml_sum(ctx, ggml_mul(ctx, log_probs_c, t_targets_c));
-    struct ggml_tensor * sum_log_p_r = ggml_sum(ctx, ggml_mul(ctx, log_probs_r, t_targets_r));
-    struct ggml_tensor * log_p_c = ggml_scale(ctx, sum_log_p_c, 1.0f / n_tokens_c);
-    struct ggml_tensor * log_p_r = ggml_scale(ctx, sum_log_p_r, 1.0f / n_tokens_r);
+    // Log-probs using cross_entropy_loss (numerically stable, matches Dense)
+    // log_p = -avg_ce where avg_ce is the average cross-entropy per token
+    struct ggml_tensor * ce_c = ggml_cross_entropy_loss(ctx, logits_c, t_targets_c);
+    struct ggml_tensor * ce_r = ggml_cross_entropy_loss(ctx, logits_r, t_targets_r);
+    struct ggml_tensor * log_p_c = ggml_neg(ctx, ce_c);
+    struct ggml_tensor * log_p_r = ggml_neg(ctx, ce_r);
 
     // Reference logp as constants
     struct ggml_tensor * t_ref_c = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);

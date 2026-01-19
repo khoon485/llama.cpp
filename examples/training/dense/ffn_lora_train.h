@@ -25,13 +25,15 @@ namespace dense {
 // ============================================================================
 
 struct ffn_lora_config {
+    // Auto-detected from model (do not set manually)
     int n_layers = 0;
     int n_embd = 0;
-    int n_ff = 0;      // FFN intermediate size (ffn_geglu dimension)
+    int n_ff = 0;       // FFN intermediate size
+
+    // User configurable
     int rank = 8;
     float alpha = 32.0f;
     float rms_norm_eps = 1e-6f;
-
     float scale() const { return alpha / (float)rank; }
 };
 
@@ -68,7 +70,8 @@ struct ffn_lora_storage {
 // ============================================================================
 // Kaiming/He initialization
 // ============================================================================
-
+// Generate random numbers using Box-Muller transform
+// Sample from normal distribution N(0, std)
 inline void ffn_init_kaiming(std::vector<float> & data, int fan_in) {
     float std = std::sqrt(2.0f / (float)fan_in);
     for (size_t i = 0; i < data.size(); i++) {
@@ -177,47 +180,51 @@ inline bool get_tensor_as_f32(
 inline void load_norm_weights_from_model(
     ffn_lora_storage & storage,
     const llama_model * model,
-    int target_layer  // 학습할 레이어 인덱스 (-1이면 마지막)
+    int target_layer 
 ) {
     int n_layers = storage.cfg.n_layers;
     int n_embd = storage.cfg.n_embd;
-    int layer_idx = (target_layer < 0) ? (n_layers - 1) : target_layer;
+
+    if (target_layer < 0 || target_layer >= n_layers) {
+        printf("[ffn_lora] ERROR: invalid target_layer %d (valid: 0-%d)\n",
+               target_layer, n_layers - 1);
+        exit(1);
+    }
+
+    int layer_idx = target_layer;
 
     // ffn_post_norm weights for target layer
-    if (layer_idx < n_layers && model->layers[layer_idx].ffn_post_norm) {
-        struct ggml_tensor * t = model->layers[layer_idx].ffn_post_norm;
-        printf("[ffn_lora] ffn_post_norm tensor type: %d (F32=%d, F16=%d, BF16=%d)\n",
-               t->type, GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16);
-        get_tensor_as_f32(t, storage.ffn_post_norm_weights[layer_idx], n_embd);
+    if (model->layers[layer_idx].ffn_post_norm) {
+        get_tensor_as_f32(model->layers[layer_idx].ffn_post_norm,
+                          storage.ffn_post_norm_weights[layer_idx], n_embd);
     }
 
     // output_norm (result_norm) weights
     if (model->output_norm) {
-        struct ggml_tensor * t = model->output_norm;
-        printf("[ffn_lora] output_norm tensor type: %d\n", t->type);
-        get_tensor_as_f32(t, storage.output_norm_weights, n_embd);
+        get_tensor_as_f32(model->output_norm, storage.output_norm_weights, n_embd);
     }
-
-    printf("[ffn_lora] Loaded norm weights for layer %d\n", layer_idx);
 }
 
 // ============================================================================
-// Training step result
+// Training step result (shared by DPO and SFT)
 // ============================================================================
 
 struct ffn_lora_step_result {
-    float loss = INFINITY;
-    float log_p_c = 0.0f;
-    float log_p_r = 0.0f;
-    float margin = 0.0f;
+    // Common (used by both DPO and SFT)
+    float loss = INFINITY;      // DPO: softplus loss, SFT: cross-entropy loss
 
-    // Gradients for the trained layer
+    // DPO only (unused in SFT)
+    float log_p_c = 0.0f;       // chosen log probability
+    float log_p_r = 0.0f;       // rejected log probability
+    float margin = 0.0f;        // log_p_c - log_p_r
+
+    // Gradients (used by both)
     std::vector<float> grad_a;  // [n_ff * rank]
     std::vector<float> grad_b;  // [rank * n_embd]
 };
 
 // ============================================================================
-// DPO Training Step - 전략 A: 정확한 inference 경로
+// DPO Training Step 
 //
 // GGML 그래프:
 //   ffn_geglu → LoRA_delta → ffn_out' = ffn_out + delta
@@ -243,10 +250,7 @@ inline ffn_lora_step_result ffn_lora_dpo_step(
     float ref_logp_c,
     float ref_logp_r,
     int target_layer,  // 학습할 레이어
-    bool compute_grad,
-    const std::vector<float> & cap_result_norm_c = {},  // 디버그용: 캡처된 result_norm
-    const std::vector<float> & cap_ffn_post_norm_c = {},  // 디버그용: 캡처된 ffn_post_norm
-    const std::vector<float> & cap_l_out_c = {}  // 디버그용: 캡처된 l_out (output_norm 전)
+    bool compute_grad
 ) {
     ffn_lora_step_result result;
     result.loss = INFINITY;
@@ -322,7 +326,7 @@ inline ffn_lora_step_result ffn_lora_dpo_step(
     ggml_set_input(t_ref_r);
 
     // ============================================================================
-    // LoRA parameters (학습 대상)
+    // LoRA parameters
     // ============================================================================
 
     // A: [n_ff, rank] - for matmul: [rank, n_ff] @ [n_ff, n_tokens] = [rank, n_tokens]
@@ -334,7 +338,7 @@ inline ffn_lora_step_result ffn_lora_dpo_step(
     ggml_set_param(t_lora_b);
 
     // ============================================================================
-    // Forward pass: 정확한 inference 경로
+    // Forward pass
     // ============================================================================
 
     // Step 1: LoRA delta = scale * B @ A @ ffn_geglu
@@ -486,6 +490,15 @@ inline ffn_lora_step_result ffn_lora_dpo_step(
 
     // Initialize gradient accumulators
     if (compute_grad) {
+        if (!grad_loss || !grad_a || !grad_b) {
+            printf("[ffn_lora] ERROR: failed to find gradient tensors in graph\n");
+            printf("[ffn_lora]   grad_loss=%p, grad_a=%p, grad_b=%p\n",
+                   (void*)grad_loss, (void*)grad_a, (void*)grad_b);
+            ggml_backend_buffer_free(buf);
+            ggml_free(ctx);
+            return result;
+        }
+
         float one = 1.0f;
         ggml_backend_tensor_set(grad_loss, &one, 0, sizeof(float));
         std::vector<float> zeros_a(n_ff * rank, 0.0f);
@@ -508,184 +521,6 @@ inline ffn_lora_step_result ffn_lora_dpo_step(
     ggml_backend_tensor_get(log_p_c, &result.log_p_c, 0, sizeof(float));
     ggml_backend_tensor_get(log_p_r, &result.log_p_r, 0, sizeof(float));
     result.margin = result.log_p_c - result.log_p_r;
-
-    // DEBUG: 중간 값 확인 및 cap.data와 비교
-    static int debug_inter = 0;
-    if (debug_inter < 1) {
-        // 먼저 입력값 확인
-        fprintf(stderr, "\n[DEBUG INPUT] 입력 tensor 검증:\n");
-        float in_ffn_sum = 0, in_sa_sum = 0;
-        for (int i = 0; i < n_embd && i < (int)ffn_out_c.size(); i++) {
-            in_ffn_sum += std::abs(ffn_out_c[i]);
-            in_sa_sum += std::abs(sa_out_c[i]);
-        }
-        fprintf(stderr, "  ffn_out_c (입력) sum = %.4f\n", in_ffn_sum);
-        fprintf(stderr, "  sa_out_c (입력) sum  = %.4f\n", in_sa_sum);
-        // GPU에 전달된 후 확인
-        std::vector<float> gpu_ffn(n_embd), gpu_sa(n_embd);
-        ggml_backend_tensor_get(t_ffn_out_c, gpu_ffn.data(), 0, n_embd * sizeof(float));
-        ggml_backend_tensor_get(t_sa_out_c, gpu_sa.data(), 0, n_embd * sizeof(float));
-        float gpu_ffn_sum = 0, gpu_sa_sum = 0;
-        for (int i = 0; i < n_embd; i++) {
-            gpu_ffn_sum += std::abs(gpu_ffn[i]);
-            gpu_sa_sum += std::abs(gpu_sa[i]);
-        }
-        fprintf(stderr, "  t_ffn_out_c (GPU) sum = %.4f\n", gpu_ffn_sum);
-        fprintf(stderr, "  t_sa_out_c (GPU) sum  = %.4f\n", gpu_sa_sum);
-
-        std::vector<float> delta_vals(n_embd * n_tokens_c);
-        std::vector<float> ffn_mod_vals(n_embd * n_tokens_c);
-        std::vector<float> post_norm_vals(n_embd * n_tokens_c);
-        std::vector<float> hidden_vals(n_embd * n_tokens_c);
-        std::vector<float> final_vals(n_embd * n_tokens_c);
-        ggml_backend_tensor_get(delta_c, delta_vals.data(), 0, delta_vals.size() * sizeof(float));
-        ggml_backend_tensor_get(ffn_out_mod_c, ffn_mod_vals.data(), 0, ffn_mod_vals.size() * sizeof(float));
-        ggml_backend_tensor_get(post_norm_c, post_norm_vals.data(), 0, post_norm_vals.size() * sizeof(float));
-        ggml_backend_tensor_get(hidden_c, hidden_vals.data(), 0, hidden_vals.size() * sizeof(float));
-        ggml_backend_tensor_get(final_c, final_vals.data(), 0, final_vals.size() * sizeof(float));
-
-        // 첫 토큰의 첫 n_embd 값 sum
-        float delta_sum = 0, ffn_mod_sum = 0, post_norm_sum = 0, hidden_sum = 0, final_sum = 0;
-        for (int i = 0; i < n_embd; i++) {
-            delta_sum += std::abs(delta_vals[i]);
-            ffn_mod_sum += std::abs(ffn_mod_vals[i]);
-            post_norm_sum += std::abs(post_norm_vals[i]);
-            hidden_sum += std::abs(hidden_vals[i]);
-            final_sum += std::abs(final_vals[i]);
-        }
-        fprintf(stderr, "\n[DEBUG INTER] 중간값 sum (token 0의 [0:n_embd]):\n");
-        fprintf(stderr, "  delta        = %.4f (LoRA 출력, 초기에 ~0이어야 함)\n", delta_sum);
-        fprintf(stderr, "  ffn_mod      = %.4f (ffn_out + delta)\n", ffn_mod_sum);
-        fprintf(stderr, "  post_norm    = %.4f (ffn_post_norm 적용 후)\n", post_norm_sum);
-        fprintf(stderr, "  hidden       = %.4f (sa_out + post_norm)\n", hidden_sum);
-        fprintf(stderr, "  final        = %.4f (result_norm 재계산)\n", final_sum);
-
-        // cap.data (캡처된 result_norm)와 비교
-        if (!cap_result_norm_c.empty()) {
-            // 첫 토큰
-            float cap_sum_first = 0, final_sum_first = 0;
-            for (int i = 0; i < n_embd && i < (int)cap_result_norm_c.size(); i++) {
-                cap_sum_first += std::abs(cap_result_norm_c[i]);
-                final_sum_first += std::abs(final_vals[i]);
-            }
-            // 마지막 토큰
-            int last_offset = (n_tokens_c - 1) * n_embd;
-            float cap_sum_last = 0, final_sum_last = 0;
-            for (int i = 0; i < n_embd && (last_offset + i) < (int)cap_result_norm_c.size(); i++) {
-                cap_sum_last += std::abs(cap_result_norm_c[last_offset + i]);
-                final_sum_last += std::abs(final_vals[last_offset + i]);
-            }
-            fprintf(stderr, "  [Token 0]  final=%.4f, cap=%.4f, diff=%.4f\n",
-                    final_sum_first, cap_sum_first, final_sum_first - cap_sum_first);
-            fprintf(stderr, "  [Token %d] final=%.4f, cap=%.4f, diff=%.4f\n",
-                    n_tokens_c - 1, final_sum_last, cap_sum_last, final_sum_last - cap_sum_last);
-
-            // 마지막 토큰의 첫 5개 값 비교
-            fprintf(stderr, "\n[DEBUG INTER] 마지막 토큰 값 비교 (처음 5개):\n");
-            for (int i = 0; i < 5 && (last_offset + i) < n_embd * n_tokens_c; i++) {
-                fprintf(stderr, "  [%d] final=%.6f, cap=%.6f, diff=%.6f\n",
-                        i, final_vals[last_offset + i], cap_result_norm_c[last_offset + i],
-                        final_vals[last_offset + i] - cap_result_norm_c[last_offset + i]);
-            }
-        }
-
-        // norm weights 확인
-        fprintf(stderr, "\n[DEBUG INTER] norm weights:\n");
-        float ffn_post_sum = 0, output_sum = 0;
-        for (int i = 0; i < n_embd; i++) {
-            ffn_post_sum += std::abs(storage.ffn_post_norm_weights[layer_idx][i]);
-            output_sum += std::abs(storage.output_norm_weights[i]);
-        }
-        fprintf(stderr, "  ffn_post_norm sum = %.4f\n", ffn_post_sum);
-        fprintf(stderr, "  output_norm sum   = %.4f\n", output_sum);
-        fprintf(stderr, "  ffn_post_norm[0:5] = %.4f, %.4f, %.4f, %.4f, %.4f\n",
-                storage.ffn_post_norm_weights[layer_idx][0],
-                storage.ffn_post_norm_weights[layer_idx][1],
-                storage.ffn_post_norm_weights[layer_idx][2],
-                storage.ffn_post_norm_weights[layer_idx][3],
-                storage.ffn_post_norm_weights[layer_idx][4]);
-        fprintf(stderr, "  output_norm[0:5]   = %.4f, %.4f, %.4f, %.4f, %.4f\n",
-                storage.output_norm_weights[0],
-                storage.output_norm_weights[1],
-                storage.output_norm_weights[2],
-                storage.output_norm_weights[3],
-                storage.output_norm_weights[4]);
-
-        // 핵심 비교: ffn_post_norm 출력 비교
-        if (!cap_ffn_post_norm_c.empty()) {
-            fprintf(stderr, "\n[DEBUG COMPARE] ffn_post_norm 출력 비교:\n");
-            float calc_sum = 0, cap_sum = 0;
-            for (int i = 0; i < n_embd && i < (int)cap_ffn_post_norm_c.size(); i++) {
-                calc_sum += std::abs(post_norm_vals[i]);
-                cap_sum += std::abs(cap_ffn_post_norm_c[i]);
-            }
-            fprintf(stderr, "  계산된 post_norm sum = %.4f\n", calc_sum);
-            fprintf(stderr, "  캡처된 ffn_post_norm sum = %.4f\n", cap_sum);
-            fprintf(stderr, "  비율: %.4f\n", calc_sum / (cap_sum + 1e-10f));
-
-            // 처음 5개 값 직접 비교
-            fprintf(stderr, "  값 비교 (처음 5개):\n");
-            for (int i = 0; i < 5 && i < (int)cap_ffn_post_norm_c.size(); i++) {
-                fprintf(stderr, "    [%d] calc=%.6f, cap=%.6f, diff=%.6f\n",
-                        i, post_norm_vals[i], cap_ffn_post_norm_c[i],
-                        post_norm_vals[i] - cap_ffn_post_norm_c[i]);
-            }
-        }
-
-        // 핵심 비교: l_out (hidden) 비교 - output_norm 전
-        if (!cap_l_out_c.empty()) {
-            fprintf(stderr, "\n[DEBUG COMPARE] l_out (hidden_c) 비교 - output_norm 전:\n");
-            float calc_sum = 0, cap_sum = 0;
-            for (int i = 0; i < n_embd && i < (int)cap_l_out_c.size(); i++) {
-                calc_sum += std::abs(hidden_vals[i]);
-                cap_sum += std::abs(cap_l_out_c[i]);
-            }
-            fprintf(stderr, "  계산된 hidden_c sum = %.4f\n", calc_sum);
-            fprintf(stderr, "  캡처된 l_out sum = %.4f\n", cap_sum);
-            fprintf(stderr, "  비율: %.4f\n", calc_sum / (cap_sum + 1e-10f));
-
-            // 처음 5개 값 직접 비교
-            fprintf(stderr, "  값 비교 (처음 5개):\n");
-            for (int i = 0; i < 5 && i < (int)cap_l_out_c.size(); i++) {
-                fprintf(stderr, "    [%d] calc=%.6f, cap=%.6f, diff=%.6f\n",
-                        i, hidden_vals[i], cap_l_out_c[i],
-                        hidden_vals[i] - cap_l_out_c[i]);
-            }
-        }
-
-        debug_inter++;
-    }
-
-    // Debug: check intermediate values
-    if (std::isnan(result.loss) || std::isinf(result.loss)) {
-        fprintf(stderr, "[DEBUG ffn_lora] loss is nan/inf, checking intermediates...\n");
-
-        // Check intermediate tensor values
-        auto check_tensor = [&backend](struct ggml_tensor * t, const char * name) {
-            std::vector<float> data(ggml_nelements(t));
-            ggml_backend_tensor_get(t, data.data(), 0, data.size() * sizeof(float));
-            float sum = 0.0f, min_v = INFINITY, max_v = -INFINITY;
-            int nan_count = 0, inf_count = 0;
-            for (float v : data) {
-                if (std::isnan(v)) nan_count++;
-                else if (std::isinf(v)) inf_count++;
-                else {
-                    sum += v;
-                    min_v = std::min(min_v, v);
-                    max_v = std::max(max_v, v);
-                }
-            }
-            fprintf(stderr, "[DEBUG] %s: shape=[%lld,%lld], sum=%f, min=%f, max=%f, nan=%d, inf=%d\n",
-                    name, (long long)t->ne[0], (long long)t->ne[1], sum, min_v, max_v, nan_count, inf_count);
-        };
-
-        check_tensor(delta_c, "delta_c");
-        check_tensor(ffn_out_mod_c, "ffn_out_mod_c");
-        check_tensor(post_norm_c, "post_norm_c");
-        check_tensor(hidden_c, "hidden_c");
-        check_tensor(final_c, "final_c");
-        check_tensor(logits_c, "logits_c");
-    }
 
     // ============================================================================
     // Backward pass
@@ -715,75 +550,36 @@ inline void apply_ffn_lora_gradients(
     ffn_lora_storage & storage,
     const ffn_lora_step_result & result,
     int target_layer,
-    float lr,
-    float max_grad_norm = 10.0f  // avg CE gradient는 작으므로 여유있게
+    float lr
 ) {
     int layer_idx = (target_layer < 0) ? (storage.cfg.n_layers - 1) : target_layer;
     if (layer_idx >= storage.cfg.n_layers) return;
     if (result.grad_a.empty() || result.grad_b.empty()) return;
 
-    // DEBUG: print gradient statistics
-    static int debug_count = 0;
-    if (debug_count < 5) {
-        // Gradient A stats
-        float grad_a_sum = 0.0f, grad_a_max = 0.0f, grad_a_min = INFINITY;
-        for (float g : result.grad_a) {
-            grad_a_sum += g * g;
-            grad_a_max = std::max(grad_a_max, std::abs(g));
-            grad_a_min = std::min(grad_a_min, std::abs(g));
-        }
-        float grad_a_norm = std::sqrt(grad_a_sum);
-
-        // Gradient B stats
-        float grad_b_sum = 0.0f, grad_b_max = 0.0f, grad_b_min = INFINITY;
-        for (float g : result.grad_b) {
-            grad_b_sum += g * g;
-            grad_b_max = std::max(grad_b_max, std::abs(g));
-            grad_b_min = std::min(grad_b_min, std::abs(g));
-        }
-        float grad_b_norm = std::sqrt(grad_b_sum);
-
-        fprintf(stderr, "\n[DEBUG GRAD %d] grad_a: norm=%.6f max=%.6f min=%.6f\n",
-                debug_count, grad_a_norm, grad_a_max, grad_a_min);
-        fprintf(stderr, "[DEBUG GRAD %d] grad_b: norm=%.6f max=%.6f min=%.6f\n",
-                debug_count, grad_b_norm, grad_b_max, grad_b_min);
-        fprintf(stderr, "[DEBUG GRAD %d] clip_a: %.6f, clip_b: %.6f\n",
-                debug_count,
-                (grad_a_norm > max_grad_norm) ? (max_grad_norm / grad_a_norm) : 1.0f,
-                (grad_b_norm > max_grad_norm) ? (max_grad_norm / grad_b_norm) : 1.0f);
-        debug_count++;
-    }
-
-    auto clip_and_update = [lr, max_grad_norm](
+    // Adam optimizer (β1=0.9, β2=0.999, ε=1e-8)
+    auto adam_update = [lr](
         std::vector<float> & weights,
         const std::vector<float> & grads,
         adam_state & state
     ) {
         if (grads.empty()) return;
-
-        // Compute gradient norm
-        float grad_norm = 0.0f;
-        for (float g : grads) grad_norm += g * g;
-        grad_norm = std::sqrt(grad_norm);
-
-        float clip = (grad_norm > max_grad_norm) ? (max_grad_norm / grad_norm) : 1.0f;
-
         if (state.m.empty()) state.init(weights.size());
         state.t++;
 
-        float bc1 = 1.0f - std::pow(0.9f, state.t);
-        float bc2 = 1.0f - std::pow(0.999f, state.t);
+        const float beta1 = 0.9f, beta2 = 0.999f, eps = 1e-8f;
+        float bc1 = 1.0f - std::pow(beta1, state.t);
+        float bc2 = 1.0f - std::pow(beta2, state.t);
 
         for (size_t i = 0; i < weights.size(); i++) {
-            float g = grads[i] * clip;
-            state.m[i] = 0.9f * state.m[i] + 0.1f * g;
-            state.v[i] = 0.999f * state.v[i] + 0.001f * g * g;
-            weights[i] -= lr * (state.m[i] / bc1) / (std::sqrt(state.v[i] / bc2) + 1e-8f);
+            float g = grads[i];
+            state.m[i] = beta1 * state.m[i] + (1.0f - beta1) * g;
+            state.v[i] = beta2 * state.v[i] + (1.0f - beta2) * g * g;
+            weights[i] -= lr * (state.m[i] / bc1) / (std::sqrt(state.v[i] / bc2) + eps);
         }
     };
 
-    clip_and_update(storage.layers[layer_idx].lora_a, result.grad_a, storage.adam_a[layer_idx]);
-    clip_and_update(storage.layers[layer_idx].lora_b, result.grad_b, storage.adam_b[layer_idx]);
+    adam_update(storage.layers[layer_idx].lora_a, result.grad_a, storage.adam_a[layer_idx]);
+    adam_update(storage.layers[layer_idx].lora_b, result.grad_b, storage.adam_b[layer_idx]);
 }
 
 // ============================================================================
@@ -845,16 +641,17 @@ inline bool save_ffn_lora_gguf(
 
 // ============================================================================
 // GGUF Load
+// Returns: detected layer_idx on success, exits on failure
 // ============================================================================
 
-inline bool load_ffn_lora_gguf(ffn_lora_storage & storage, const char * path) {
+inline int load_ffn_lora_gguf(ffn_lora_storage & storage, const char * path) {
     struct ggml_context * meta_ctx = nullptr;
     struct gguf_init_params params = { true, &meta_ctx };
     struct gguf_context * gguf_ctx = gguf_init_from_file(path, params);
 
     if (!gguf_ctx) {
         printf("[ffn_lora] ERROR: Failed to open %s\n", path);
-        return false;
+        exit(1);
     }
 
     // Alpha
@@ -865,52 +662,84 @@ inline bool load_ffn_lora_gguf(ffn_lora_storage & storage, const char * path) {
 
     FILE * fp = fopen(path, "rb");
     if (!fp) {
+        printf("[ffn_lora] ERROR: Failed to open file %s\n", path);
         ggml_free(meta_ctx);
         gguf_free(gguf_ctx);
-        return false;
+        exit(1);
     }
+
+    // RAII-style cleanup
+    auto cleanup = [&]() {
+        fclose(fp);
+        ggml_free(meta_ctx);
+        gguf_free(gguf_ctx);
+    };
 
     size_t data_offset = gguf_get_data_offset(gguf_ctx);
     int n_tensors = gguf_get_n_tensors(gguf_ctx);
+    int detected_layer = -1;  // track which layer was loaded
 
     for (int i = 0; i < n_tensors; i++) {
         const char * name = gguf_get_tensor_name(gguf_ctx, i);
         struct ggml_tensor * t = ggml_get_tensor(meta_ctx, name);
 
         int layer_idx = -1;
-        char ab[16] = {0};
-        if (sscanf(name, "blk.%d.ffn_down.weight.lora_%s", &layer_idx, ab) != 2) {
+        char ab = '\0';
+        if (sscanf(name, "blk.%d.ffn_down.weight.lora_%c", &layer_idx, &ab) != 2) {
             continue;
         }
 
         if (layer_idx < 0 || layer_idx >= (int)storage.layers.size()) {
-            continue;
+            printf("[ffn_lora] ERROR: invalid layer_idx %d (max: %d)\n",
+                   layer_idx, (int)storage.layers.size() - 1);
+            cleanup();
+            exit(1);
         }
+
+        detected_layer = layer_idx;
 
         size_t tensor_size = ggml_nbytes(t);
         size_t tensor_offset = gguf_get_tensor_offset(gguf_ctx, i);
 
         std::vector<float> * target = nullptr;
-        if (strcmp(ab, "a") == 0) {
+        if (ab == 'a') {
             target = &storage.layers[layer_idx].lora_a;
-        } else if (strcmp(ab, "b") == 0) {
+        } else if (ab == 'b') {
             target = &storage.layers[layer_idx].lora_b;
         }
 
         if (!target || tensor_size != target->size() * sizeof(float)) {
-            continue;
+            printf("[ffn_lora] ERROR: tensor size mismatch for %s (file: %zu, expected: %zu)\n",
+                   name, tensor_size, target->size() * sizeof(float));
+            cleanup();
+            exit(1);
         }
 
-        fseek(fp, data_offset + tensor_offset, SEEK_SET);
-        fread(target->data(), sizeof(float), target->size(), fp);
+        if (fseek(fp, data_offset + tensor_offset, SEEK_SET) != 0) {
+            printf("[ffn_lora] ERROR: fseek failed for %s (offset: %zu)\n",
+                   name, data_offset + tensor_offset);
+            cleanup();
+            exit(1);
+        }
+
+        size_t read_count = fread(target->data(), sizeof(float), target->size(), fp);
+        if (read_count != target->size()) {
+            printf("[ffn_lora] ERROR: fread failed for %s (read: %zu, expected: %zu)\n",
+                   name, read_count, target->size());
+            cleanup();
+            exit(1);
+        }
     }
 
-    fclose(fp);
-    ggml_free(meta_ctx);
-    gguf_free(gguf_ctx);
+    if (detected_layer < 0) {
+        printf("[ffn_lora] ERROR: no valid LoRA tensors found in %s\n", path);
+        cleanup();
+        exit(1);
+    }
 
-    printf("[ffn_lora] Loaded from %s (alpha=%.1f)\n", path, storage.cfg.alpha);
-    return true;
+    cleanup();
+    printf("[ffn_lora] Loaded from %s (layer=%d, alpha=%.1f)\n", path, detected_layer, storage.cfg.alpha);
+    return detected_layer;
 }
 
 // ============================================================================
@@ -1095,8 +924,17 @@ inline ffn_lora_step_result ffn_lora_sft_step(
     ggml_backend_tensor_set(t_lora_a, storage.layers[layer_idx].lora_a.data(), 0, n_ff * rank * sizeof(float));
     ggml_backend_tensor_set(t_lora_b, storage.layers[layer_idx].lora_b.data(), 0, rank * n_embd * sizeof(float));
 
-    // Initialize gradient accumulators
+    // Initialize gradient accumulators (same as DPO, but single sequence)
     if (compute_grad) {
+        if (!grad_loss || !grad_a || !grad_b) {
+            printf("[ffn_lora_sft] ERROR: failed to find gradient tensors in graph\n");
+            printf("[ffn_lora_sft]   grad_loss=%p, grad_a=%p, grad_b=%p\n",
+                   (void*)grad_loss, (void*)grad_a, (void*)grad_b);
+            ggml_backend_buffer_free(buf);
+            ggml_free(ctx);
+            return result;
+        }
+
         float one = 1.0f;
         ggml_backend_tensor_set(grad_loss, &one, 0, sizeof(float));
         std::vector<float> zeros_a(n_ff * rank, 0.0f);
